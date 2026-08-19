@@ -144,7 +144,7 @@ async def issues_slash(interaction: discord.Interaction, start_date: str, end_da
 
 @bot.tree.command(name="kryptonian", description="It's the Man of Tomorrow himself..")
 async def kryptonian_slash(interaction: discord.Interaction):
-    await handle_kryptonian(interaction)
+    await handle_kryptonian(interaction) 
 
 # removes the default help command
 bot.remove_command('help')
@@ -161,30 +161,6 @@ async def help(interaction: discord.Interaction):
     hembed.add_field(
         name="issues",
         value="Fetches a list of comic issues from the specified publisher within the specified date range. Date format is YYYY-MM-DD",
-        inline=False
-    )
-
-    hembed.add_field(
-        name="batlist",
-        value="Sends the old Batman reading list.",
-        inline=False
-    )
-
-    hembed.add_field(
-        name="rero",
-        value="it's a surprise...",
-        inline=False
-    )
-
-    hembed.add_field(
-        name="kryptonian",
-        value="Sends a picture of the Man of Steel!",
-        inline=False
-    )
-
-    hembed.add_field(
-        name="donut",
-        value="Sends an image of a delicious donut",
         inline=False
     )
 
