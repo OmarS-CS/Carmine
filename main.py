@@ -199,31 +199,3 @@ async def help(interaction: discord.Interaction):
 #ensures the bot only goes online when directly run
 if __name__ == '__main__':
     bot.run(config.token)
-
-# Prefix commands
-@bot.command()
-async def batlist(ctx):
-    print("here's the old batman reading list..")
-    textfile_path = "readinglist.txt"
-    await ctx.send(file=discord.File(textfile_path))
-
-@bot.command()
-async def rero(ctx):
-    video_path = "rerorerorero.mov"
-    await ctx.send(file=discord.File(video_path))
-
-@bot.command()
-async def kryptonian(ctx):
-    await ctx.send("The Man of Steel himself...")
-    image_path = "superman.jpg"
-    await ctx.send(file=discord.File(image_path))
-
-@bot.command()
-async def donut(ctx):
-    await ctx.send("here's a donut!")
-    image_path = "raspberry_donut.jpg"
-    await ctx.send(file=discord.File(image_path))
-
-@bot.command()
-async def sillytest(ctx):
-    await ctx.send("meow ^_^")
