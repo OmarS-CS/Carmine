@@ -117,7 +117,12 @@ async def handle_kryptonian(interaction):
     
     except Exception as e:
         error_message = f"An error has occured: {e}"
-        await interaction.followup.send(error_message)
+        await interaction.followup.send(error_message)    
+
+# Slash commands
+@bot.tree.command(name="issues", description="Fetches comic issues given publisher and date range. Use the YYYY-MM-DD date format.")
+async def issues_slash(interaction: discord.Interaction, start_date: str, end_date: str, publisher: str):
+    await handle_issues(interaction, start_date, end_date, publisher)
 
 @bot.tree.command(name="series_lookup", description="Search for a comic series title.")
 @app_commands.describe(name="The name of the comic series")
@@ -135,12 +140,6 @@ async def series_lookup(interaction: Interaction, name: str):
 
     except Exception as e:
         await interaction.followup.send(f"An error occurred: {e}", ephemeral=True)
-    
-
-# Slash commands
-@bot.tree.command(name="issues", description="Fetches comic issues given publisher and date range. Use the YYYY-MM-DD date format.")
-async def issues_slash(interaction: discord.Interaction, start_date: str, end_date: str, publisher: str):
-    await handle_issues(interaction, start_date, end_date, publisher)
 
 @bot.tree.command(name="kryptonian", description="It's the Man of Tomorrow himself..")
 async def kryptonian_slash(interaction: discord.Interaction):
