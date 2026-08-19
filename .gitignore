@@ -2551,3 +2551,4 @@ __pycache__/
 /.venv/Lib/site-packages
 /.vs
 /.venv/Scripts
+/oldmain.py
