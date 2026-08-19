@@ -2550,3 +2550,4 @@ __pycache__/
 .venv/Lib/site-packages/tomli-2.0.1.dist-info/WHEEL
 /.venv/Lib/site-packages
 /.vs
+/.venv/Scripts
