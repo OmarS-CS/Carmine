@@ -112,12 +112,17 @@ async def handle_issues(interaction, start_date: str, end_date: str, publisher: 
 
 async def handle_kryptonian(interaction):
     try:
-        await interaction.response.defer() #gives time for processing
-        
-    
+        image = discord.File("superman.jpg")
+        await interaction.response.send_message(
+            "The Man of Steel himself...",
+            file=image
+        )
     except Exception as e:
         error_message = f"An error has occured: {e}"
-        await interaction.followup.send(error_message)    
+        if interaction.response.is_done():
+            await interaction.followup.send(error_message)
+        else:
+            await interaction.response.send_message(error_message)
 
 # Slash commands
 @bot.tree.command(name="issues", description="Fetches comic issues given publisher and date range. Use the YYYY-MM-DD date format.")
