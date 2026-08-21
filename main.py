@@ -544,13 +544,22 @@ class IssuePageButton(
                 len(matches),
             )
             view = build_issue_lookup_view(
-                self.lookup_id,
-                self.page,
+                lookup_id,
+                0,
                 len(matches),
-                stored_user_id,
+                interaction.user.id,
             )
 
-            await interaction.edit_original_response(embed=embed, view=view)
+            send_options = {
+                "embed": embed,
+            }
+
+            if view is not None:
+                send_options["view"] = view
+
+            await interaction.followup.send(
+                **send_options
+            )
 
             # Follow the user's browsing direction so the next likely page is ready.
             schedule_issue_prefetch(matches, self.page, self.direction)
@@ -569,11 +578,12 @@ def build_issue_lookup_view(
     total_pages: int,
     user_id: int,
 ):
-    """Build the persistent Previous/Next controls for an issue lookup."""
-    if total_pages <= 1:
-        return None
-
     view = View(timeout=None)
+
+    # If there is only one result, return an empty view.
+    if total_pages <= 1:
+        return view
+
     previous_page = max(0, current_page - 1)
     next_page = min(total_pages - 1, current_page + 1)
 
@@ -586,6 +596,7 @@ def build_issue_lookup_view(
             disabled=current_page == 0,
         )
     )
+
     view.add_item(
         IssuePageButton(
             lookup_id,
