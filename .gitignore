@@ -2552,3 +2552,8 @@ __pycache__/
 /.vs
 /.venv/Scripts
 /oldmain.py
+/carmine.db
+/main.py.bak
+/main.py.bak2
+/main.py.bak3
+/test.py
