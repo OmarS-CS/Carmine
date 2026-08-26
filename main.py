@@ -30,7 +30,7 @@ DB_PATH = BASE_DIR / "carmine.db"
 SUPERMAN_IMAGE_PATH = BASE_DIR / "superman.jpg"
 
 EMBED_COLOR = discord.Color.green()
-DISCORD_MESSAGE_LIMIT = 2_000
+ISSUE_LIST_PAGE_LIMIT = 4_000
 EMBED_DESCRIPTION_LIMIT = 1_500
 EMBED_FIELD_LIMIT = 1_024
 
@@ -51,6 +51,7 @@ class CarmineBot(commands.Bot):
         """Initialize persistent state and sync slash commands once per startup."""
         init_lookup_db()
         self.add_dynamic_items(IssuePageButton)
+        self.add_dynamic_items(IssueListPageButton)
         await self.tree.sync()
 
 
@@ -160,6 +161,16 @@ def init_lookup_db() -> None:
             )
             """
         )
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS issue_searches (
+                search_id TEXT PRIMARY KEY,
+                date_label TEXT NOT NULL,
+                pages_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
 
 
 def create_lookup_record(user_id: int, issue_results):
@@ -209,6 +220,41 @@ def load_lookup_record(lookup_id: str):
 
     user_id, matches_json = row
     return int(user_id), json.loads(matches_json)
+
+
+def create_issue_search_record(date_label: str, pages: list[str]) -> str:
+    """Store rendered /issues pages so persistent buttons can restore them."""
+    search_id = secrets.token_hex(8)
+
+    with sqlite3.connect(DB_PATH) as db:
+        db.execute(
+            """
+            INSERT INTO issue_searches (search_id, date_label, pages_json)
+            VALUES (?, ?, ?)
+            """,
+            (search_id, date_label, json.dumps(pages)),
+        )
+
+    return search_id
+
+
+def load_issue_search_record(search_id: str):
+    """Load a stored /issues paginator by its persistent search ID."""
+    with sqlite3.connect(DB_PATH) as db:
+        row = db.execute(
+            """
+            SELECT date_label, pages_json
+            FROM issue_searches
+            WHERE search_id = ?
+            """,
+            (search_id,),
+        ).fetchone()
+
+    if row is None:
+        return None
+
+    date_label, pages_json = row
+    return date_label, json.loads(pages_json)
 
 
 def load_cached_issue(issue_id: int):
@@ -544,22 +590,13 @@ class IssuePageButton(
                 len(matches),
             )
             view = build_issue_lookup_view(
-                lookup_id,
-                0,
+                self.lookup_id,
+                self.page,
                 len(matches),
-                interaction.user.id,
+                stored_user_id,
             )
 
-            send_options = {
-                "embed": embed,
-            }
-
-            if view is not None:
-                send_options["view"] = view
-
-            await interaction.followup.send(
-                **send_options
-            )
+            await interaction.edit_original_response(embed=embed, view=view)
 
             # Follow the user's browsing direction so the next likely page is ready.
             schedule_issue_prefetch(matches, self.page, self.direction)
@@ -578,12 +615,11 @@ def build_issue_lookup_view(
     total_pages: int,
     user_id: int,
 ):
+    """Build the persistent Previous/Next controls for an issue lookup."""
     view = View(timeout=None)
 
-    # If there is only one result, return an empty view.
     if total_pages <= 1:
         return view
-
     previous_page = max(0, current_page - 1)
     next_page = min(total_pages - 1, current_page + 1)
 
@@ -596,7 +632,6 @@ def build_issue_lookup_view(
             disabled=current_page == 0,
         )
     )
-
     view.add_item(
         IssuePageButton(
             lookup_id,
@@ -611,19 +646,175 @@ def build_issue_lookup_view(
 
 
 # ---------------------------------------------------------------------------
+# Persistent /issues pagination
+# ---------------------------------------------------------------------------
+
+
+class IssueListPageButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=(
+        r"carmine:issues:"
+        r"(?P<search_id>[0-9a-f]{16}):"
+        r"(?P<page>[0-9]+):"
+        r"(?P<direction>prev|next)"
+    ),
+):
+    """Persistent Previous/Next button for /issues result lists."""
+
+    def __init__(
+        self,
+        search_id: str,
+        page: int,
+        direction: str,
+        *,
+        disabled: bool = False,
+    ):
+        if direction == "prev":
+            label = "Previous"
+            emoji = "◀️"
+        else:
+            label = "Next"
+            emoji = "▶️"
+
+        custom_id = f"carmine:issues:{search_id}:{page}:{direction}"
+
+        super().__init__(
+            discord.ui.Button(
+                label=label,
+                emoji=emoji,
+                style=discord.ButtonStyle.secondary,
+                custom_id=custom_id,
+                disabled=disabled,
+            )
+        )
+
+        self.search_id = search_id
+        self.page = page
+        self.direction = direction
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        """Reconstruct a /issues button from the state in its custom ID."""
+        return cls(
+            search_id=match["search_id"],
+            page=int(match["page"]),
+            direction=match["direction"],
+            disabled=item.disabled,
+        )
+
+    async def callback(self, interaction: Interaction) -> None:
+        """Load a stored result page and update the original Discord message."""
+        await interaction.response.defer()
+
+        try:
+            record = await asyncio.to_thread(
+                load_issue_search_record,
+                self.search_id,
+            )
+
+            if record is None:
+                await interaction.followup.send(
+                    "This issue search is no longer stored by Carmine.",
+                    ephemeral=True,
+                )
+                return
+
+            date_label, pages = record
+
+            if not 0 <= self.page < len(pages):
+                await interaction.followup.send(
+                    "That results page no longer exists.",
+                    ephemeral=True,
+                )
+                return
+
+            embed = build_issue_list_embed(
+                pages[self.page],
+                self.page,
+                len(pages),
+                date_label,
+            )
+            view = build_issue_list_view(
+                self.search_id,
+                self.page,
+                len(pages),
+            )
+
+            await interaction.edit_original_response(embed=embed, view=view)
+
+        except Exception as exc:
+            traceback.print_exc()
+            await interaction.followup.send(
+                f"An error occurred while changing pages: {exc}",
+                ephemeral=True,
+            )
+
+
+def build_issue_list_view(
+    search_id: str,
+    current_page: int,
+    total_pages: int,
+) -> View:
+    """Build persistent Previous/Next controls for an /issues result list."""
+    view = View(timeout=None)
+
+    if total_pages <= 1:
+        return view
+
+    previous_page = max(0, current_page - 1)
+    next_page = min(total_pages - 1, current_page + 1)
+
+    view.add_item(
+        IssueListPageButton(
+            search_id,
+            previous_page,
+            "prev",
+            disabled=current_page == 0,
+        )
+    )
+    view.add_item(
+        IssueListPageButton(
+            search_id,
+            next_page,
+            "next",
+            disabled=current_page == total_pages - 1,
+        )
+    )
+
+    return view
+
+
+def build_issue_list_embed(
+    page_text: str,
+    current_page: int,
+    total_pages: int,
+    date_label: str,
+) -> discord.Embed:
+    """Build one /issues result embed from a stored page string."""
+    return discord.Embed(
+        title=(
+            f"Issues by {date_label} "
+            f"(Page {current_page + 1}/{total_pages})"
+        ),
+        description=page_text,
+        color=EMBED_COLOR,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Command helpers
 # ---------------------------------------------------------------------------
 
 
 def create_issue_list_pages(issues) -> list[str]:
-    """Split /issues results into messages that fit Discord's 2,000-char limit."""
+    """Split /issues results into pages that fit comfortably in an embed."""
     pages = []
     page = "Here are the issues for your query: (Comic ID on the left)\n\n"
 
     for issue in issues:
         line = f"**{issue.id}**: {issue.issue_name}\n"
 
-        if len(page) + len(line) > DISCORD_MESSAGE_LIMIT:
+        if len(page) + len(line) > ISSUE_LIST_PAGE_LIMIT:
             pages.append(page)
             page = ""
 
@@ -704,7 +895,7 @@ async def handle_issues(
     publisher: str,
     date_type: str = "cover",
 ) -> None:
-    """Fetch a publisher/date range and paginate the results with reactions."""
+    """Fetch a publisher/date range and paginate results with persistent buttons."""
     await interaction.response.defer()
 
     try:
@@ -746,59 +937,25 @@ async def handle_issues(
         if not pages:
             pages = ["No issues were found for the given query."]
 
-        embed = discord.Embed(
-            title=f"Issues by {date_label} (Page 1/{len(pages)})",
-            description=pages[0],
-            color=EMBED_COLOR,
+        embed = build_issue_list_embed(
+            pages[0],
+            0,
+            len(pages),
+            date_label,
         )
-        message = await interaction.followup.send(embed=embed, wait=True)
 
         if len(pages) <= 1:
+            await interaction.followup.send(embed=embed)
             return
 
-        await message.add_reaction("◀️")
-        await message.add_reaction("▶️")
+        search_id = await asyncio.to_thread(
+            create_issue_search_record,
+            date_label,
+            pages,
+        )
+        view = build_issue_list_view(search_id, 0, len(pages))
 
-        def reaction_check(reaction, user) -> bool:
-            return (
-                user != bot.user
-                and reaction.message.id == message.id
-                and str(reaction.emoji) in {"◀️", "▶️"}
-            )
-
-        current_page = 0
-
-        while True:
-            try:
-                reaction, user = await bot.wait_for(
-                    "reaction_add",
-                    timeout=120.0,
-                    check=reaction_check,
-                )
-
-                if str(reaction.emoji) == "◀️":
-                    current_page = (current_page - 1) % len(pages)
-                else:
-                    current_page = (current_page + 1) % len(pages)
-
-                new_embed = discord.Embed(
-                    title=(
-                        f"Issues by {date_label} "
-                        f"(Page {current_page + 1}/{len(pages)})"
-                    ),
-                    description=pages[current_page],
-                    color=EMBED_COLOR,
-                )
-                await message.edit(embed=new_embed)
-                await message.remove_reaction(reaction, user)
-
-            except asyncio.TimeoutError:
-                try:
-                    await message.clear_reactions()
-                except discord.Forbidden:
-                    # Pagination still expires cleanly if Carmine cannot clear reactions.
-                    pass
-                break
+        await interaction.followup.send(embed=embed, view=view)
 
     except Exception as exc:
         traceback.print_exc()
