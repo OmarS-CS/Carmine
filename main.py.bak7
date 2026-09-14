@@ -121,32 +121,13 @@ def display_name(value, default: str = "Unknown") -> str:
 
 
 def series_display_name(series) -> str:
-    """Return a readable title for a Metron series result.
-
-    Mokkari's BaseSeries model exposes the API's ``series`` field as
-    ``display_name``. The fallbacks keep this helper compatible with other
-    series models returned by Metron/Mokkari.
-    """
-    for attribute in (
-        "display_name",
-        "name",
-        "series_name",
-        "title",
-        "sort_name",
-    ):
-        value = getattr(series, attribute, None)
-        if value:
-            return str(value)
-
-    # Pydantic models may expose API aliases only when serialized.
-    if hasattr(series, "model_dump"):
-        data = series.model_dump(by_alias=True)
-        for key in ("series", "name", "series_name", "title", "sort_name"):
-            value = data.get(key)
-            if value:
-                return str(value)
-
-    return f"Series {getattr(series, 'id', '?')}"
+    """Return the display title used by Metron series-list results."""
+    return str(
+        getattr(series, "series", None)
+        or getattr(series, "name", None)
+        or getattr(series, "sort_name", None)
+        or f"Series {getattr(series, 'id', '?')}"
+    )
 
 
 def _format_log_context(context: dict | None) -> str:

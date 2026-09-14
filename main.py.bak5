@@ -6,12 +6,9 @@ issue-result pagination using SQLite and Discord dynamic components.
 
 import asyncio
 import json
-import logging
 import secrets
 import sqlite3
-import time
 import traceback
-from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
@@ -36,25 +33,10 @@ EMBED_COLOR = discord.Color.green()
 ISSUE_LIST_PAGE_LIMIT = 4_000
 EMBED_DESCRIPTION_LIMIT = 1_500
 EMBED_FIELD_LIMIT = 1_024
-METRON_MAX_CONCURRENCY = 3
 
 # Only active background fetches live in memory. Completed tasks remove themselves.
 _background_tasks: set[asyncio.Task] = set()
 _issue_fetch_tasks: dict[int, asyncio.Task] = {}
-_metron_semaphore = asyncio.Semaphore(METRON_MAX_CONCURRENCY)
-
-logger = logging.getLogger("carmine")
-logger.setLevel(logging.INFO)
-logger.propagate = False
-if not logger.handlers:
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(
-        logging.Formatter(
-            "%(asctime)s | %(levelname)s | %(message)s",
-            datefmt="%H:%M:%S",
-        )
-    )
-    logger.addHandler(console_handler)
 
 metron = mokkari.api(config.username, config.password)
 
@@ -71,9 +53,6 @@ class CarmineBot(commands.Bot):
         self.add_dynamic_items(IssuePageButton)
         self.add_dynamic_items(IssueListPageButton)
         await self.tree.sync()
-        logger.info(
-            "Startup setup complete | dynamic items registered | slash commands synced"
-        )
 
 
 bot = CarmineBot(command_prefix="*", intents=intents, case_insensitive=True)
@@ -83,21 +62,14 @@ bot.remove_command("help")
 @bot.event
 async def on_ready() -> None:
     """Log when Carmine has connected to Discord."""
-    logger.info("Carmine is ready as %s", bot.user)
+    print("-----------------------------")
+    print("the bot is now ready for use!")
+    print("-----------------------------")
 
 
 # ---------------------------------------------------------------------------
 # General helpers
 # ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class IssueListEntry:
-    """Lightweight issue data used by /issues and its cover-year cache."""
-
-    id: int
-    issue_name: str
-    cover_date: date | None
 
 
 def truncate(text: str, limit: int) -> str:
@@ -120,138 +92,6 @@ def display_name(value, default: str = "Unknown") -> str:
     return text if text else default
 
 
-def series_display_name(series) -> str:
-    """Return a readable title for a Metron series result.
-
-    Mokkari's BaseSeries model exposes the API's ``series`` field as
-    ``display_name``. The fallbacks keep this helper compatible with other
-    series models returned by Metron/Mokkari.
-    """
-    for attribute in (
-        "display_name",
-        "name",
-        "series_name",
-        "title",
-        "sort_name",
-    ):
-        value = getattr(series, attribute, None)
-        if value:
-            return str(value)
-
-    # Pydantic models may expose API aliases only when serialized.
-    if hasattr(series, "model_dump"):
-        data = series.model_dump(by_alias=True)
-        for key in ("series", "name", "series_name", "title", "sort_name"):
-            value = data.get(key)
-            if value:
-                return str(value)
-
-    return f"Series {getattr(series, 'id', '?')}"
-
-
-def _format_log_context(context: dict | None) -> str:
-    """Format optional operation metadata for concise console timing logs."""
-    if not context:
-        return ""
-
-    values = ", ".join(f"{key}={value}" for key, value in context.items())
-    return f" | {values}"
-
-
-def log_elapsed(
-    category: str,
-    operation: str,
-    started_at: float,
-    *,
-    context: dict | None = None,
-) -> None:
-    """Log elapsed wall-clock time for a completed operation."""
-    elapsed = time.perf_counter() - started_at
-    logger.info(
-        "[%s] %s completed in %.3fs%s",
-        category,
-        operation,
-        elapsed,
-        _format_log_context(context),
-    )
-
-
-async def run_blocking(
-    category: str,
-    operation: str,
-    func,
-    *args,
-    context: dict | None = None,
-    **kwargs,
-):
-    """Run blocking work off the event loop and record its duration."""
-    started_at = time.perf_counter()
-
-    try:
-        result = await asyncio.to_thread(func, *args, **kwargs)
-    except Exception:
-        elapsed = time.perf_counter() - started_at
-        logger.exception(
-            "[%s] %s failed after %.3fs%s",
-            category,
-            operation,
-            elapsed,
-            _format_log_context(context),
-        )
-        raise
-
-    log_elapsed(category, operation, started_at, context=context)
-    return result
-
-
-async def db_call(
-    operation: str,
-    func,
-    *args,
-    context: dict | None = None,
-    **kwargs,
-):
-    """Run and time one SQLite operation without blocking Discord's event loop."""
-    return await run_blocking(
-        "SQLITE",
-        operation,
-        func,
-        *args,
-        context=context,
-        **kwargs,
-    )
-
-
-async def metron_call(
-    operation: str,
-    func,
-    *args,
-    context: dict | None = None,
-    **kwargs,
-):
-    """Run one Metron call with shared timing and bounded concurrency."""
-    queued_at = time.perf_counter()
-
-    async with _metron_semaphore:
-        queue_wait = time.perf_counter() - queued_at
-        if queue_wait >= 0.010:
-            logger.info(
-                "[METRON] %s waited %.3fs for a request slot%s",
-                operation,
-                queue_wait,
-                _format_log_context(context),
-            )
-
-        return await run_blocking(
-            "METRON",
-            operation,
-            func,
-            *args,
-            context=context,
-            **kwargs,
-        )
-
-
 # ---------------------------------------------------------------------------
 # Series lookup UI
 # ---------------------------------------------------------------------------
@@ -261,24 +101,14 @@ class SeriesSelect(Select):
     """Dropdown containing up to Discord's 25 allowed series choices."""
 
     def __init__(self, series_results):
-        options = []
-
-        for series in series_results[:25]:
-            year_began = getattr(series, "year_began", None)
-            description_parts = []
-
-            if year_began is not None:
-                description_parts.append(f"Started {year_began}")
-
-            description_parts.append(f"Metron ID {series.id}")
-
-            options.append(
-                SelectOption(
-                    label=series_display_name(series)[:100],
-                    description=" • ".join(description_parts)[:100],
-                    value=str(series.id),
-                )
+        options = [
+            SelectOption(
+                label=series.name[:100],
+                description=f"ID: {series.id}",
+                value=str(series.id),
             )
+            for series in series_results[:25]
+        ]
 
         super().__init__(
             placeholder="Select a comic series...",
@@ -328,17 +158,6 @@ def init_lookup_db() -> None:
                 issue_id INTEGER PRIMARY KEY,
                 details_json TEXT NOT NULL,
                 cached_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS issue_year_cache (
-                publisher_key TEXT NOT NULL,
-                cover_year INTEGER NOT NULL,
-                issues_json TEXT NOT NULL,
-                cached_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (publisher_key, cover_year)
             )
             """
         )
@@ -401,84 +220,6 @@ def load_lookup_record(lookup_id: str):
 
     user_id, matches_json = row
     return int(user_id), json.loads(matches_json)
-
-
-def _publisher_cache_key(publisher: str) -> str:
-    """Normalize publisher text so cache lookups are case-insensitive."""
-    return publisher.strip().casefold()
-
-
-def _serialize_issue_year_results(issue_results) -> list[dict]:
-    """Convert one Metron cover-year response into compact JSON-safe records."""
-    records = []
-
-    for issue in issue_results:
-        cover_date = getattr(issue, "cover_date", None)
-        records.append(
-            {
-                "id": int(issue.id),
-                "issue_name": str(getattr(issue, "issue_name", f"Issue {issue.id}")),
-                "cover_date": cover_date.isoformat() if cover_date else None,
-            }
-        )
-
-    return records
-
-
-def _deserialize_issue_year_results(records: list[dict]) -> list[IssueListEntry]:
-    """Rebuild lightweight /issues entries from cached JSON records."""
-    return [
-        IssueListEntry(
-            id=int(record["id"]),
-            issue_name=str(record["issue_name"]),
-            cover_date=(
-                date.fromisoformat(record["cover_date"])
-                if record.get("cover_date")
-                else None
-            ),
-        )
-        for record in records
-    ]
-
-
-def load_cached_issue_year(publisher: str, cover_year: int):
-    """Load a publisher/year issue list from SQLite, if it has been cached."""
-    publisher_key = _publisher_cache_key(publisher)
-
-    with sqlite3.connect(DB_PATH) as db:
-        row = db.execute(
-            """
-            SELECT issues_json
-            FROM issue_year_cache
-            WHERE publisher_key = ? AND cover_year = ?
-            """,
-            (publisher_key, cover_year),
-        ).fetchone()
-
-    if row is None:
-        return None
-
-    return _deserialize_issue_year_results(json.loads(row[0]))
-
-
-def store_cached_issue_year(publisher: str, cover_year: int, issue_results) -> list[IssueListEntry]:
-    """Persist one complete publisher/year result set and return lightweight entries."""
-    publisher_key = _publisher_cache_key(publisher)
-    records = _serialize_issue_year_results(issue_results)
-
-    with sqlite3.connect(DB_PATH) as db:
-        db.execute(
-            """
-            INSERT INTO issue_year_cache (publisher_key, cover_year, issues_json, cached_at)
-            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(publisher_key, cover_year) DO UPDATE SET
-                issues_json = excluded.issues_json,
-                cached_at = CURRENT_TIMESTAMP
-            """,
-            (publisher_key, cover_year, json.dumps(records)),
-        )
-
-    return _deserialize_issue_year_results(records)
 
 
 def create_issue_search_record(date_label: str, pages: list[str]) -> str:
@@ -596,39 +337,19 @@ def normalize_issue_details(issue) -> dict:
 
 async def get_issue_details(issue_id: int) -> dict:
     """Return cached issue details, fetching Metron only on a cache miss."""
-    cached = await db_call(
-        "issue cache read",
-        load_cached_issue,
-        issue_id,
-        context={"issue_id": issue_id},
-    )
+    cached = await asyncio.to_thread(load_cached_issue, issue_id)
     if cached is not None:
-        logger.info("[CACHE] issue detail hit | issue_id=%s", issue_id)
         return cached
-
-    logger.info("[CACHE] issue detail miss | issue_id=%s", issue_id)
 
     # If a prefetch for this issue is already running, share that request.
     existing_task = _issue_fetch_tasks.get(issue_id)
     if existing_task is not None:
-        logger.info("[CACHE] awaiting in-flight issue fetch | issue_id=%s", issue_id)
         return await existing_task
 
     async def fetch_and_cache() -> dict:
-        issue = await metron_call(
-            "issue details",
-            metron.issue,
-            issue_id,
-            context={"issue_id": issue_id},
-        )
+        issue = await asyncio.to_thread(metron.issue, issue_id)
         details = normalize_issue_details(issue)
-        await db_call(
-            "issue cache write",
-            store_cached_issue,
-            issue_id,
-            details,
-            context={"issue_id": issue_id},
-        )
+        await asyncio.to_thread(store_cached_issue, issue_id, details)
         return details
 
     task = asyncio.create_task(fetch_and_cache())
@@ -835,21 +556,10 @@ class IssuePageButton(
 
     async def callback(self, interaction: Interaction) -> None:
         """Load the requested page from SQLite/Metron and update the message."""
-        page_started = time.perf_counter()
-        page_context = {
-            "lookup_id": self.lookup_id,
-            "page": self.page + 1,
-            "direction": self.direction,
-        }
         await interaction.response.defer()
 
         try:
-            record = await db_call(
-                "issue lookup read",
-                load_lookup_record,
-                self.lookup_id,
-                context={"lookup_id": self.lookup_id},
-            )
+            record = await asyncio.to_thread(load_lookup_record, self.lookup_id)
 
             if record is None:
                 await interaction.followup.send(
@@ -896,13 +606,6 @@ class IssuePageButton(
             await interaction.followup.send(
                 f"An error occurred while changing pages: {exc}",
                 ephemeral=True,
-            )
-        finally:
-            log_elapsed(
-                "UI",
-                "/issue_lookup page change",
-                page_started,
-                context=page_context,
             )
 
 
@@ -1001,20 +704,12 @@ class IssueListPageButton(
 
     async def callback(self, interaction: Interaction) -> None:
         """Load a stored result page and update the original Discord message."""
-        page_started = time.perf_counter()
-        page_context = {
-            "search_id": self.search_id,
-            "page": self.page + 1,
-            "direction": self.direction,
-        }
         await interaction.response.defer()
 
         try:
-            record = await db_call(
-                "issue search read",
+            record = await asyncio.to_thread(
                 load_issue_search_record,
                 self.search_id,
-                context={"search_id": self.search_id},
             )
 
             if record is None:
@@ -1052,13 +747,6 @@ class IssueListPageButton(
             await interaction.followup.send(
                 f"An error occurred while changing pages: {exc}",
                 ephemeral=True,
-            )
-        finally:
-            log_elapsed(
-                "UI",
-                "/issues page change",
-                page_started,
-                context=page_context,
             )
 
 
@@ -1138,65 +826,26 @@ def create_issue_list_pages(issues) -> list[str]:
     return pages
 
 
-async def fetch_issues_by_cover_date(
+def fetch_issues_by_cover_date(
     start: date,
     end: date,
     publisher: str,
 ):
-    """Fetch cover-year results with an indefinite SQLite cache, then filter locally."""
+    """Fetch issues by cover year, then apply the exact cover-date range locally."""
     matching_issues = []
     seen_issue_ids = set()
-    cache_hits = 0
-    cache_misses = 0
 
     for year in range(start.year, end.year + 1):
-        context = {"publisher": publisher, "cover_year": year}
-        year_results = await db_call(
-            "issue year cache read",
-            load_cached_issue_year,
-            publisher,
-            year,
-            context=context,
+        year_results = metron.issues_list(
+            {
+                "cover_year": year,
+                "publisher_name": publisher,
+            }
         )
 
-        if year_results is None:
-            cache_misses += 1
-            logger.info(
-                "[CACHE] issue year miss | publisher=%s, cover_year=%s",
-                publisher,
-                year,
-            )
-
-            metron_results = await metron_call(
-                "issues list by cover year",
-                metron.issues_list,
-                {
-                    "cover_year": year,
-                    "publisher_name": publisher,
-                },
-                context=context,
-            )
-
-            year_results = await db_call(
-                "issue year cache write",
-                store_cached_issue_year,
-                publisher,
-                year,
-                metron_results,
-                context={**context, "issues": len(metron_results)},
-            )
-        else:
-            cache_hits += 1
-            logger.info(
-                "[CACHE] issue year hit | publisher=%s, cover_year=%s, issues=%s",
-                publisher,
-                year,
-                len(year_results),
-            )
-
         for issue in year_results:
-            cover_date = issue.cover_date
-            issue_id = issue.id
+            cover_date = getattr(issue, "cover_date", None)
+            issue_id = getattr(issue, "id", None)
 
             if (
                 cover_date is not None
@@ -1208,40 +857,26 @@ async def fetch_issues_by_cover_date(
 
     matching_issues.sort(
         key=lambda issue: (
-            issue.cover_date or date.max,
-            issue.issue_name.casefold(),
+            getattr(issue, "cover_date", date.max),
+            str(getattr(issue, "issue_name", "")).casefold(),
         )
-    )
-
-    logger.info(
-        "[CACHE] issue year summary | publisher=%s, hits=%s, misses=%s",
-        publisher,
-        cache_hits,
-        cache_misses,
     )
 
     return matching_issues
 
 
-async def fetch_issues_by_release_date(
+def fetch_issues_by_release_date(
     start: date,
     end: date,
     publisher: str,
 ):
     """Fetch issues using Metron's store-date range filters."""
-    issues = await metron_call(
-        "issues list by release date",
-        metron.issues_list,
+    issues = metron.issues_list(
         {
             "store_date_range_after": start.isoformat(),
             "store_date_range_before": end.isoformat(),
             "publisher_name": publisher,
-        },
-        context={
-            "publisher": publisher,
-            "start": start.isoformat(),
-            "end": end.isoformat(),
-        },
+        }
     )
 
     return sorted(
@@ -1261,13 +896,6 @@ async def handle_issues(
     date_type: str = "cover",
 ) -> None:
     """Fetch a publisher/date range and paginate results with persistent buttons."""
-    command_started = time.perf_counter()
-    command_context = {
-        "publisher": publisher,
-        "start": start_date,
-        "end": end_date,
-        "date_type": date_type,
-    }
     await interaction.response.defer()
 
     try:
@@ -1289,28 +917,23 @@ async def handle_issues(
             return
 
         if date_type == "release":
-            issues_list = await fetch_issues_by_release_date(
+            issues_list = await asyncio.to_thread(
+                fetch_issues_by_release_date,
                 start,
                 end,
                 publisher,
             )
             date_label = "Release Date"
         else:
-            issues_list = await fetch_issues_by_cover_date(
+            issues_list = await asyncio.to_thread(
+                fetch_issues_by_cover_date,
                 start,
                 end,
                 publisher,
             )
             date_label = "Cover Date"
 
-        processing_started = time.perf_counter()
         pages = create_issue_list_pages(issues_list)
-        log_elapsed(
-            "LOCAL",
-            "build /issues pages",
-            processing_started,
-            context={"issues": len(issues_list)},
-        )
         if not pages:
             pages = ["No issues were found for the given query."]
 
@@ -1325,12 +948,10 @@ async def handle_issues(
             await interaction.followup.send(embed=embed)
             return
 
-        search_id = await db_call(
-            "issue search write",
+        search_id = await asyncio.to_thread(
             create_issue_search_record,
             date_label,
             pages,
-            context={"pages": len(pages)},
         )
         view = build_issue_list_view(search_id, 0, len(pages))
 
@@ -1339,19 +960,10 @@ async def handle_issues(
     except Exception as exc:
         traceback.print_exc()
         await interaction.followup.send(f"An error occurred: {exc}")
-    finally:
-        log_elapsed(
-            "COMMAND",
-            "/issues",
-            command_started,
-            context=command_context,
-        )
 
 
 async def handle_kryptonian(interaction: Interaction) -> None:
     """Send the local Superman image."""
-    command_started = time.perf_counter()
-
     try:
         image = discord.File(SUPERMAN_IMAGE_PATH)
         await interaction.response.send_message(
@@ -1365,8 +977,6 @@ async def handle_kryptonian(interaction: Interaction) -> None:
             await interaction.followup.send(error_message)
         else:
             await interaction.response.send_message(error_message)
-    finally:
-        log_elapsed("COMMAND", "/kryptonian", command_started)
 
 
 # ---------------------------------------------------------------------------
@@ -1414,16 +1024,12 @@ async def issues_slash(
 @app_commands.describe(name="The name of the comic series")
 async def series_lookup(interaction: Interaction, name: str) -> None:
     """Search Metron for series and present a selection menu."""
-    command_started = time.perf_counter()
-    command_context = {"name": name}
     await interaction.response.defer(thinking=True)
 
     try:
-        series_results = await metron_call(
-            "series list",
+        series_results = await asyncio.to_thread(
             metron.series_list,
-            {"name": name},
-            context=command_context,
+            {"series_name": name},
         )
 
         if not series_results:
@@ -1445,13 +1051,6 @@ async def series_lookup(interaction: Interaction, name: str) -> None:
         await interaction.followup.send(
             f"An error occurred: {exc}",
             ephemeral=True,
-        )
-    finally:
-        log_elapsed(
-            "COMMAND",
-            "/series_lookup",
-            command_started,
-            context=command_context,
         )
 
 
@@ -1479,13 +1078,6 @@ async def issue_lookup(
     publisher: str | None = None,
 ) -> None:
     """Find matching issues and display persistent paginated results."""
-    command_started = time.perf_counter()
-    command_context = {
-        "series": series,
-        "issue_number": issue_number,
-        "year": year,
-        "publisher": publisher,
-    }
     await interaction.response.defer(thinking=True)
 
     try:
@@ -1501,11 +1093,9 @@ async def issue_lookup(
             filters["publisher_name"] = publisher
 
         issue_results = list(
-            await metron_call(
-                "issue lookup search",
+            await asyncio.to_thread(
                 metron.issues_list,
                 filters,
-                context=command_context,
             )
         )
 
@@ -1516,12 +1106,10 @@ async def issue_lookup(
             )
             return
 
-        lookup_id, matches = await db_call(
-            "issue lookup write",
+        lookup_id, matches = await asyncio.to_thread(
             create_lookup_record,
             interaction.user.id,
             issue_results,
-            context={"matches": len(issue_results)},
         )
 
         embed = await build_issue_embed(matches[0], 0, len(matches))
@@ -1543,19 +1131,11 @@ async def issue_lookup(
             f"An error occurred: {exc}",
             ephemeral=True,
         )
-    finally:
-        log_elapsed(
-            "COMMAND",
-            "/issue_lookup",
-            command_started,
-            context=command_context,
-        )
 
 
 @bot.tree.command(name="help", description="List Carmine's commands and what they do.")
 async def help_command(interaction: Interaction) -> None:
     """Display Carmine's slash-command help."""
-    command_started = time.perf_counter()
     embed = discord.Embed(
         title="Bot Commands",
         description="Here are the commands you can use:",
@@ -1593,7 +1173,6 @@ async def help_command(interaction: Interaction) -> None:
     )
 
     await interaction.response.send_message(embed=embed)
-    log_elapsed("COMMAND", "/help", command_started)
 
 
 # ---------------------------------------------------------------------------
