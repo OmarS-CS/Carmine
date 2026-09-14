@@ -16,6 +16,7 @@ from database import (
 )
 from metron_service import metron, metron_call, schedule_issue_prefetch
 from settings import EMBED_COLOR, ISSUE_LIST_PAGE_LIMIT, SUPERMAN_IMAGE_PATH
+from status import CommandStatus
 from ui import (
     SeriesView,
     build_issue_embed,
@@ -50,14 +51,18 @@ async def fetch_issues_by_cover_date(
     start: date,
     end: date,
     publisher: str,
+    progress_callback=None,
 ):
-    """Fetch cover-year results with an indefinite SQLite cache, then filter locally."""
+    """Fetch cached cover-year results, reporting progress before Metron misses."""
     matching_issues = []
     seen_issue_ids = set()
     cache_hits = 0
     cache_misses = 0
 
-    for year in range(start.year, end.year + 1):
+    years = list(range(start.year, end.year + 1))
+    total_years = len(years)
+
+    for year_index, year in enumerate(years, start=1):
         context = {"publisher": publisher, "cover_year": year}
         year_results = await db_call(
             "issue year cache read",
@@ -74,6 +79,9 @@ async def fetch_issues_by_cover_date(
                 publisher,
                 year,
             )
+
+            if progress_callback is not None:
+                await progress_callback(year, year_index, total_years)
 
             metron_results = await metron_call(
                 "issues list by cover year",
@@ -176,32 +184,74 @@ async def handle_issues(
         "end": end_date,
         "date_type": date_type,
     }
-    await interaction.response.defer()
+    status = CommandStatus(interaction)
 
     try:
         try:
             start = date.fromisoformat(start_date)
             end = date.fromisoformat(end_date)
         except ValueError:
-            await interaction.followup.send(
+            await interaction.response.send_message(
                 "Dates must use the YYYY-MM-DD format.",
                 ephemeral=True,
             )
             return
 
         if end < start:
-            await interaction.followup.send(
+            await interaction.response.send_message(
                 "The end date must be the same as or later than the start date.",
                 ephemeral=True,
             )
             return
 
+        date_label = "Release Date" if date_type == "release" else "Cover Date"
+        await status.start(
+            "🔎 **Searching comic issues...**\n"
+            f"**Publisher:** {publisher}\n"
+            f"**Date type:** {date_label}\n"
+            f"**Range:** {start_date} → {end_date}"
+        )
+
         if date_type == "release":
+            await status.update(
+                "⏳ **Searching Metron...**\n"
+                f"Looking for {publisher} issues by release date from "
+                f"{start_date} → {end_date}."
+            )
             issues_list = await fetch_issues_by_release_date(start, end, publisher)
-            date_label = "Release Date"
         else:
-            issues_list = await fetch_issues_by_cover_date(start, end, publisher)
-            date_label = "Cover Date"
+            total_years = end.year - start.year + 1
+
+            if total_years > 1:
+                await status.update(
+                    "🗂️ **Checking Carmine's cover-date cache...**\n"
+                    f"{publisher} • {start.year}–{end.year} • {total_years} years"
+                )
+
+            async def report_cover_year_progress(
+                year: int,
+                year_index: int,
+                year_count: int,
+            ) -> None:
+                if year_count == 1:
+                    progress = f"Fetching **{year}** from Metron..."
+                else:
+                    progress = (
+                        f"Fetching **{year}** from Metron "
+                        f"(year {year_index}/{year_count})..."
+                    )
+
+                await status.update(
+                    "⏳ **Searching cover-date records...**\n"
+                    f"{progress}"
+                )
+
+            issues_list = await fetch_issues_by_cover_date(
+                start,
+                end,
+                publisher,
+                progress_callback=report_cover_year_progress,
+            )
 
         processing_started = time.perf_counter()
         pages = create_issue_list_pages(issues_list)
@@ -217,7 +267,7 @@ async def handle_issues(
         embed = build_issue_list_embed(pages[0], 0, len(pages), date_label)
 
         if len(pages) <= 1:
-            await interaction.followup.send(embed=embed)
+            await status.finish(embed=embed)
             return
 
         search_id = await db_call(
@@ -229,11 +279,11 @@ async def handle_issues(
         )
         view = build_issue_list_view(search_id, 0, len(pages))
 
-        await interaction.followup.send(embed=embed, view=view)
+        await status.finish(embed=embed, view=view)
 
     except Exception as exc:
         traceback.print_exc()
-        await interaction.followup.send(f"An error occurred: {exc}")
+        await status.error(f"An error occurred: {exc}")
     finally:
         log_elapsed(
             "COMMAND",
@@ -303,7 +353,12 @@ def register_commands(bot: commands.Bot) -> None:
     async def series_lookup(interaction: Interaction, name: str) -> None:
         command_started = time.perf_counter()
         command_context = {"name": name}
-        await interaction.response.defer(thinking=True)
+        status = CommandStatus(interaction, ephemeral=True)
+
+        await status.start(
+            "🔎 **Searching Metron for comic series...**\n"
+            f"Looking for titles matching **{name}**."
+        )
 
         try:
             series_results = await metron_call(
@@ -314,25 +369,21 @@ def register_commands(bot: commands.Bot) -> None:
             )
 
             if not series_results:
-                await interaction.followup.send(
-                    "No matching comic series found.",
-                    ephemeral=True,
-                )
+                await status.finish(content="No matching comic series found.")
                 return
 
             view = SeriesView(series_results)
-            await interaction.followup.send(
-                "Select the comic series you're looking for:",
+            await status.finish(
+                content=(
+                    f"Found **{len(series_results)}** matching series. "
+                    "Select the one you're looking for:"
+                ),
                 view=view,
-                ephemeral=True,
             )
 
         except Exception as exc:
             traceback.print_exc()
-            await interaction.followup.send(
-                f"An error occurred: {exc}",
-                ephemeral=True,
-            )
+            await status.error(f"An error occurred: {exc}")
         finally:
             log_elapsed(
                 "COMMAND",
@@ -372,7 +423,24 @@ def register_commands(bot: commands.Bot) -> None:
             "year": year,
             "publisher": publisher,
         }
-        await interaction.response.defer(thinking=True)
+        status = CommandStatus(interaction)
+
+        filter_details = []
+        if year is not None:
+            filter_details.append(f"year {year}")
+        if publisher:
+            filter_details.append(publisher)
+
+        filter_text = (
+            f" • {' • '.join(filter_details)}"
+            if filter_details
+            else ""
+        )
+
+        await status.start(
+            "🔎 **Searching Metron for an issue...**\n"
+            f"**{series} #{issue_number}**{filter_text}"
+        )
 
         try:
             filters = {
@@ -396,11 +464,14 @@ def register_commands(bot: commands.Bot) -> None:
             )
 
             if not issue_results:
-                await interaction.followup.send(
-                    "No matching issues were found.",
-                    ephemeral=True,
-                )
+                await status.fail_ephemeral("No matching issues were found.")
                 return
+
+            await status.update(
+                f"📚 **Found {len(issue_results)} matching issue"
+                f"{'s' if len(issue_results) != 1 else ''}.**\n"
+                "Loading issue details..."
+            )
 
             lookup_id, matches = await db_call(
                 "issue lookup write",
@@ -418,15 +489,12 @@ def register_commands(bot: commands.Bot) -> None:
                 interaction.user.id,
             )
 
-            await interaction.followup.send(embed=embed, view=view)
+            await status.finish(embed=embed, view=view)
             schedule_issue_prefetch(matches, 0, "next")
 
         except Exception as exc:
             traceback.print_exc()
-            await interaction.followup.send(
-                f"An error occurred: {exc}",
-                ephemeral=True,
-            )
+            await status.fail_ephemeral(f"An error occurred: {exc}")
         finally:
             log_elapsed(
                 "COMMAND",
