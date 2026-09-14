@@ -2564,3 +2564,5 @@ __pycache__/
 /carmine.db.old
 /main.py.bak8
 /carmine.db.old2
+/old_bak_sets
+*.bak
