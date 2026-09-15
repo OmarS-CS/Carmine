@@ -6,18 +6,17 @@ import traceback
 
 import mokkari
 
-import config
 from database import (
     load_cached_issue,
     load_cached_series,
     store_cached_issue,
     store_cached_series,
 )
-from settings import METRON_MAX_CONCURRENCY
+from settings import METRON_MAX_CONCURRENCY, METRON_PASSWORD, METRON_USERNAME
 from utils import _format_log_context, db_call, display_name, logger, run_blocking
 
 
-metron = mokkari.api(config.username, config.password)
+metron = mokkari.api(METRON_USERNAME, METRON_PASSWORD)
 
 _metron_semaphore = asyncio.Semaphore(METRON_MAX_CONCURRENCY)
 _background_tasks: set[asyncio.Task] = set()

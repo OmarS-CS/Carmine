@@ -3,8 +3,8 @@
 import discord
 from discord.ext import commands
 
-import config
 from commands import register_commands
+from settings import DISCORD_TOKEN
 from database import init_lookup_db
 from ui import IssueListPageButton, IssuePageButton, SeriesPageButton
 from utils import logger
@@ -41,4 +41,4 @@ async def on_ready() -> None:
 
 
 if __name__ == "__main__":
-    bot.run(config.token)
+    bot.run(DISCORD_TOKEN)
