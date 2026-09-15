@@ -62,6 +62,17 @@ def init_lookup_db() -> None:
         )
         db.execute(
             """
+            CREATE TABLE IF NOT EXISTS issue_year_search_cache (
+                search_key TEXT NOT NULL,
+                cover_year INTEGER NOT NULL,
+                issues_json TEXT NOT NULL,
+                cached_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (search_key, cover_year)
+            )
+            """
+        )
+        db.execute(
+            """
             CREATE TABLE IF NOT EXISTS issue_searches (
                 search_id TEXT PRIMARY KEY,
                 date_label TEXT NOT NULL,
@@ -252,9 +263,19 @@ def store_cached_issue_lookup_search(search_key: str, issue_results) -> list[dic
     return matches
 
 
-def series_search_key(name: str) -> str:
-    """Build a case-insensitive cache key for /series_lookup."""
-    return _normalized_search_text(name)
+def series_search_key(name: str, year: int | None = None) -> str:
+    """Build a stable cache key for /series_lookup name/year filters."""
+    normalized_name = _normalized_search_text(name)
+
+    # Preserve compatibility with existing name-only cache entries.
+    if year is None:
+        return normalized_name
+
+    return json.dumps(
+        {"name": normalized_name, "year_began": year},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _serialize_series_results(series_results) -> list[dict]:
@@ -487,6 +508,66 @@ def store_cached_issue_year(
                 cached_at = CURRENT_TIMESTAMP
             """,
             (publisher_key, cover_year, json.dumps(records)),
+        )
+
+    return _deserialize_issue_year_results(records)
+
+
+def issue_year_search_key(
+    publisher: str | None,
+    title: str | None,
+) -> str:
+    """Build a stable key for flexible /issues cover-year searches."""
+    return json.dumps(
+        {
+            "publisher": _normalized_search_text(publisher),
+            "title": _normalized_search_text(title),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def load_cached_issue_year_search(
+    search_key: str,
+    cover_year: int,
+):
+    """Load one flexible /issues cover-year query from SQLite, if cached."""
+    with sqlite3.connect(DB_PATH) as db:
+        row = db.execute(
+            """
+            SELECT issues_json
+            FROM issue_year_search_cache
+            WHERE search_key = ? AND cover_year = ?
+            """,
+            (search_key, cover_year),
+        ).fetchone()
+
+    if row is None:
+        return None
+
+    return _deserialize_issue_year_results(json.loads(row[0]))
+
+
+def store_cached_issue_year_search(
+    search_key: str,
+    cover_year: int,
+    issue_results,
+) -> list[IssueListEntry]:
+    """Persist one flexible /issues cover-year query indefinitely."""
+    records = _serialize_issue_year_results(issue_results)
+
+    with sqlite3.connect(DB_PATH) as db:
+        db.execute(
+            """
+            INSERT INTO issue_year_search_cache
+                (search_key, cover_year, issues_json, cached_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(search_key, cover_year) DO UPDATE SET
+                issues_json = excluded.issues_json,
+                cached_at = CURRENT_TIMESTAMP
+            """,
+            (search_key, cover_year, json.dumps(records)),
         )
 
     return _deserialize_issue_year_results(records)

@@ -13,12 +13,15 @@ from .database import (
     create_lookup_record_from_matches,
     create_series_lookup_record,
     issue_lookup_search_key,
+    issue_year_search_key,
     load_cached_issue_lookup_search,
     load_cached_issue_year,
+    load_cached_issue_year_search,
     load_cached_series_search,
     series_search_key,
     store_cached_issue_lookup_search,
     store_cached_issue_year,
+    store_cached_issue_year_search,
     store_cached_series_search,
 )
 from .metron_service import (
@@ -63,10 +66,11 @@ def create_issue_list_pages(issues) -> list[str]:
 async def fetch_issues_by_cover_date(
     start: date,
     end: date,
-    publisher: str,
+    publisher: str | None,
+    title: str | None,
     progress_callback=None,
 ):
-    """Fetch cached cover-year results, reporting progress before Metron misses."""
+    """Fetch cover-year results for publisher/title filters with persistent caching."""
     matching_issues = []
     seen_issue_ids = set()
     cache_hits = 0
@@ -74,51 +78,83 @@ async def fetch_issues_by_cover_date(
 
     years = list(range(start.year, end.year + 1))
     total_years = len(years)
+    flexible_search_key = issue_year_search_key(publisher, title) if title else None
 
     for year_index, year in enumerate(years, start=1):
-        context = {"publisher": publisher, "cover_year": year}
-        year_results = await db_call(
-            "issue year cache read",
-            load_cached_issue_year,
-            publisher,
-            year,
-            context=context,
-        )
+        context = {
+            "publisher": publisher,
+            "title": title,
+            "cover_year": year,
+        }
+
+        # Preserve the existing publisher/year cache for publisher-only searches.
+        if title is None and publisher is not None:
+            year_results = await db_call(
+                "issue year cache read",
+                load_cached_issue_year,
+                publisher,
+                year,
+                context=context,
+            )
+        else:
+            year_results = await db_call(
+                "issue year search cache read",
+                load_cached_issue_year_search,
+                flexible_search_key,
+                year,
+                context=context,
+            )
 
         if year_results is None:
             cache_misses += 1
             logger.info(
-                "[CACHE] issue year miss | publisher=%s, cover_year=%s",
+                "[CACHE] issue year miss | publisher=%s, title=%s, cover_year=%s",
                 publisher,
+                title,
                 year,
             )
 
             if progress_callback is not None:
                 await progress_callback(year, year_index, total_years)
 
+            filters = {"cover_year": year}
+            if publisher:
+                filters["publisher_name"] = publisher
+            if title:
+                filters["series_name"] = title
+
             metron_results = await metron_call(
                 "issues list by cover year",
                 metron.issues_list,
-                {
-                    "cover_year": year,
-                    "publisher_name": publisher,
-                },
+                filters,
                 context=context,
             )
 
-            year_results = await db_call(
-                "issue year cache write",
-                store_cached_issue_year,
-                publisher,
-                year,
-                metron_results,
-                context={**context, "issues": len(metron_results)},
-            )
+            if title is None and publisher is not None:
+                year_results = await db_call(
+                    "issue year cache write",
+                    store_cached_issue_year,
+                    publisher,
+                    year,
+                    metron_results,
+                    context={**context, "issues": len(metron_results)},
+                )
+            else:
+                year_results = await db_call(
+                    "issue year search cache write",
+                    store_cached_issue_year_search,
+                    flexible_search_key,
+                    year,
+                    metron_results,
+                    context={**context, "issues": len(metron_results)},
+                )
         else:
             cache_hits += 1
             logger.info(
-                "[CACHE] issue year hit | publisher=%s, cover_year=%s, issues=%s",
+                "[CACHE] issue year hit | publisher=%s, title=%s, "
+                "cover_year=%s, issues=%s",
                 publisher,
+                title,
                 year,
                 len(year_results),
             )
@@ -143,8 +179,9 @@ async def fetch_issues_by_cover_date(
     )
 
     logger.info(
-        "[CACHE] issue year summary | publisher=%s, hits=%s, misses=%s",
+        "[CACHE] issue year summary | publisher=%s, title=%s, hits=%s, misses=%s",
         publisher,
+        title,
         cache_hits,
         cache_misses,
     )
@@ -155,19 +192,27 @@ async def fetch_issues_by_cover_date(
 async def fetch_issues_by_release_date(
     start: date,
     end: date,
-    publisher: str,
+    publisher: str | None,
+    title: str | None,
 ):
-    """Fetch issues using Metron's store-date range filters."""
+    """Fetch issues using Metron's store-date range and optional search filters."""
+    filters = {
+        "store_date_range_after": start.isoformat(),
+        "store_date_range_before": end.isoformat(),
+    }
+
+    if publisher:
+        filters["publisher_name"] = publisher
+    if title:
+        filters["series_name"] = title
+
     issues = await metron_call(
         "issues list by release date",
         metron.issues_list,
-        {
-            "store_date_range_after": start.isoformat(),
-            "store_date_range_before": end.isoformat(),
-            "publisher_name": publisher,
-        },
+        filters,
         context={
             "publisher": publisher,
+            "title": title,
             "start": start.isoformat(),
             "end": end.isoformat(),
         },
@@ -182,17 +227,32 @@ async def fetch_issues_by_release_date(
     )
 
 
+def _issues_search_description(publisher: str | None, title: str | None) -> str:
+    """Build concise user-facing text for the active /issues filters."""
+    filters = []
+    if publisher:
+        filters.append(f"**Publisher:** {publisher}")
+    if title:
+        filters.append(f"**Title:** {title}")
+    return "\n".join(filters)
+
+
 async def handle_issues(
     interaction: Interaction,
     start_date: str,
     end_date: str,
-    publisher: str,
+    publisher: str | None = None,
+    title: str | None = None,
     date_type: str = "cover",
 ) -> None:
-    """Fetch a publisher/date range and paginate results with persistent buttons."""
+    """Fetch issues by publisher, title, or both and paginate the results."""
     command_started = time.perf_counter()
+
+    publisher = publisher.strip() if publisher else None
+    title = title.strip() if title else None
     command_context = {
         "publisher": publisher,
+        "title": title,
         "start": start_date,
         "end": end_date,
         "date_type": date_type,
@@ -200,6 +260,13 @@ async def handle_issues(
     status = CommandStatus(interaction)
 
     try:
+        if not publisher and not title:
+            await interaction.response.send_message(
+                "Provide at least a publisher, a title, or both.",
+                ephemeral=True,
+            )
+            return
+
         try:
             start = date.fromisoformat(start_date)
             end = date.fromisoformat(end_date)
@@ -218,27 +285,40 @@ async def handle_issues(
             return
 
         date_label = "Release Date" if date_type == "release" else "Cover Date"
+        search_description = _issues_search_description(publisher, title)
         await status.start(
             "🔎 **Searching comic issues...**\n"
-            f"**Publisher:** {publisher}\n"
+            f"{search_description}\n"
             f"**Date type:** {date_label}\n"
             f"**Range:** {start_date} → {end_date}"
         )
 
+        search_label_parts = []
+        if publisher:
+            search_label_parts.append(publisher)
+        if title:
+            search_label_parts.append(title)
+        search_label = " • ".join(search_label_parts)
+
         if date_type == "release":
             await status.update(
                 "⏳ **Searching Metron...**\n"
-                f"Looking for {publisher} issues by release date from "
+                f"Looking for {search_label} issues by release date from "
                 f"{start_date} → {end_date}."
             )
-            issues_list = await fetch_issues_by_release_date(start, end, publisher)
+            issues_list = await fetch_issues_by_release_date(
+                start,
+                end,
+                publisher,
+                title,
+            )
         else:
             total_years = end.year - start.year + 1
 
             if total_years > 1:
                 await status.update(
                     "🗂️ **Checking Carmine's cover-date cache...**\n"
-                    f"{publisher} • {start.year}–{end.year} • {total_years} years"
+                    f"{search_label} • {start.year}–{end.year} • {total_years} years"
                 )
 
             async def report_cover_year_progress(
@@ -263,6 +343,7 @@ async def handle_issues(
                 start,
                 end,
                 publisher,
+                title,
                 progress_callback=report_cover_year_progress,
             )
 
@@ -333,14 +414,15 @@ def register_commands(bot: commands.Bot) -> None:
     @bot.tree.command(
         name="issues",
         description=(
-            "Fetch comic issues given publisher and date range. "
+            "Fetch comic issues by publisher/title and date range. "
             "Cover date is used by default."
         ),
     )
     @app_commands.describe(
         start_date="Start of the date range in YYYY-MM-DD format",
         end_date="End of the date range in YYYY-MM-DD format",
-        publisher="Publisher name, such as Marvel or DC Comics",
+        publisher="Optional publisher name, such as Marvel or DC Comics",
+        title="Optional series title, such as Amazing Spider-Man",
         date_type="Date field to search; defaults to cover date",
     )
     @app_commands.choices(
@@ -353,28 +435,48 @@ def register_commands(bot: commands.Bot) -> None:
         interaction: Interaction,
         start_date: str,
         end_date: str,
-        publisher: str,
+        publisher: str | None = None,
+        title: str | None = None,
         date_type: str = "cover",
     ) -> None:
-        await handle_issues(interaction, start_date, end_date, publisher, date_type)
+        await handle_issues(
+            interaction,
+            start_date,
+            end_date,
+            publisher,
+            title,
+            date_type,
+        )
 
     @bot.tree.command(
         name="series_lookup",
         description="Look up comic series information on Metron.",
     )
-    @app_commands.describe(name="The name of the comic series")
-    async def series_lookup(interaction: Interaction, name: str) -> None:
+    @app_commands.describe(
+        name="The name of the comic series",
+        starting_year="Optional year the series began",
+    )
+    async def series_lookup(
+        interaction: Interaction,
+        name: str,
+        starting_year: int | None = None,
+    ) -> None:
         command_started = time.perf_counter()
-        command_context = {"name": name}
+        command_context = {"name": name, "starting_year": starting_year}
         status = CommandStatus(interaction)
 
+        year_text = (
+            f" starting in **{starting_year}**"
+            if starting_year is not None
+            else ""
+        )
         await status.start(
             "🔎 **Searching for comic series...**\n"
-            f"Looking for titles matching **{name}**."
+            f"Looking for titles matching **{name}**{year_text}."
         )
 
         try:
-            search_key = series_search_key(name)
+            search_key = series_search_key(name, starting_year)
             series_results = await db_call(
                 "series search cache read",
                 load_cached_series_search,
@@ -383,16 +485,24 @@ def register_commands(bot: commands.Bot) -> None:
             )
 
             if series_results is None:
-                logger.info("[CACHE] series search miss | name=%s", name)
+                logger.info(
+                    "[CACHE] series search miss | name=%s, starting_year=%s",
+                    name,
+                    starting_year,
+                )
                 await status.update(
                     "⏳ **Searching Metron for comic series...**\n"
-                    f"Looking for titles matching **{name}**."
+                    f"Looking for titles matching **{name}**{year_text}."
                 )
+
+                filters = {"name": name}
+                if starting_year is not None:
+                    filters["year_began"] = starting_year
 
                 metron_results = await metron_call(
                     "series list",
                     metron.series_list,
-                    {"name": name},
+                    filters,
                     context=command_context,
                 )
                 series_results = await db_call(
@@ -404,8 +514,9 @@ def register_commands(bot: commands.Bot) -> None:
                 )
             else:
                 logger.info(
-                    "[CACHE] series search hit | name=%s, matches=%s",
+                    "[CACHE] series search hit | name=%s, starting_year=%s, matches=%s",
                     name,
+                    starting_year,
                     len(series_results),
                 )
 
@@ -618,8 +729,8 @@ def register_commands(bot: commands.Bot) -> None:
         embed.add_field(
             name="/issues",
             value=(
-                "Fetch issues from a publisher within a date range. "
-                "Cover date is the default; release date is also available. "
+                "Fetch issues by publisher, series title, or both within a date "
+                "range. Cover date is the default; release date is also available. "
                 "Dates use YYYY-MM-DD."
             ),
             inline=False,
@@ -627,8 +738,8 @@ def register_commands(bot: commands.Bot) -> None:
         embed.add_field(
             name="/series_lookup",
             value=(
-                "Look up a comic series and browse detailed information for "
-                "matching runs."
+                "Look up a comic series, optionally filter by starting year, and "
+                "browse detailed information for matching runs."
             ),
             inline=False,
         )
