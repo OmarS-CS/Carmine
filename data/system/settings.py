@@ -6,10 +6,14 @@ from pathlib import Path
 import discord
 
 
-BASE_DIR = Path(__file__).resolve().parent
-CONFIG_ENV_PATH = BASE_DIR / "config.env"
-DB_PATH = BASE_DIR / "carmine.db"
-SUPERMAN_IMAGE_PATH = BASE_DIR / "superman.jpg"
+SYSTEM_DIR = Path(__file__).resolve().parent
+DATA_DIR = SYSTEM_DIR.parent
+PROJECT_ROOT = DATA_DIR.parent
+MEDIA_DIR = DATA_DIR / "media"
+
+CONFIG_ENV_PATH = PROJECT_ROOT / "config.env"
+DB_PATH = DATA_DIR / "carmine.db"
+SUPERMAN_IMAGE_PATH = MEDIA_DIR / "superman.jpg"
 
 EMBED_COLOR = discord.Color.green()
 ISSUE_LIST_PAGE_LIMIT = 2_000

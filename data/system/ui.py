@@ -7,19 +7,19 @@ import discord
 from discord import Interaction
 from discord.ui import View
 
-from database import (
+from .database import (
     load_issue_search_record,
     load_lookup_record,
     load_series_lookup_record,
 )
-from metron_service import (
+from .metron_service import (
     get_issue_details,
     get_series_details,
     schedule_issue_prefetch,
     schedule_series_prefetch,
 )
-from settings import EMBED_COLOR, EMBED_DESCRIPTION_LIMIT, EMBED_FIELD_LIMIT
-from utils import db_call, log_elapsed, truncate
+from .settings import EMBED_COLOR, EMBED_DESCRIPTION_LIMIT, EMBED_FIELD_LIMIT
+from .utils import db_call, log_elapsed, truncate
 
 
 async def build_series_embed(

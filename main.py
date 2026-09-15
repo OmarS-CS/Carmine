@@ -3,11 +3,11 @@
 import discord
 from discord.ext import commands
 
-from commands import register_commands
-from settings import DISCORD_TOKEN
-from database import init_lookup_db
-from ui import IssueListPageButton, IssuePageButton, SeriesPageButton
-from utils import logger
+from data.system.commands import register_commands
+from data.system.settings import DISCORD_TOKEN
+from data.system.database import init_lookup_db
+from data.system.ui import IssueListPageButton, IssuePageButton, SeriesPageButton
+from data.system.utils import logger
 
 
 intents = discord.Intents.default()

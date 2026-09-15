@@ -6,14 +6,14 @@ import traceback
 
 import mokkari
 
-from database import (
+from .database import (
     load_cached_issue,
     load_cached_series,
     store_cached_issue,
     store_cached_series,
 )
-from settings import METRON_MAX_CONCURRENCY, METRON_PASSWORD, METRON_USERNAME
-from utils import _format_log_context, db_call, display_name, logger, run_blocking
+from .settings import METRON_MAX_CONCURRENCY, METRON_PASSWORD, METRON_USERNAME
+from .utils import _format_log_context, db_call, display_name, logger, run_blocking
 
 
 metron = mokkari.api(METRON_USERNAME, METRON_PASSWORD)

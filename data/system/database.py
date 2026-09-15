@@ -6,7 +6,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import date
 
-from settings import DB_PATH
+from .settings import DB_PATH
 
 
 @dataclass(frozen=True)

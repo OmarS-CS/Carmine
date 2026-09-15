@@ -8,7 +8,7 @@ import discord
 from discord import Interaction, app_commands
 from discord.ext import commands
 
-from database import (
+from .database import (
     create_issue_search_record,
     create_lookup_record_from_matches,
     create_series_lookup_record,
@@ -21,15 +21,15 @@ from database import (
     store_cached_issue_year,
     store_cached_series_search,
 )
-from metron_service import (
+from .metron_service import (
     metron,
     metron_call,
     schedule_issue_prefetch,
     schedule_series_prefetch,
 )
-from settings import EMBED_COLOR, ISSUE_LIST_PAGE_LIMIT, SUPERMAN_IMAGE_PATH
-from status import CommandStatus
-from ui import (
+from .settings import EMBED_COLOR, ISSUE_LIST_PAGE_LIMIT, SUPERMAN_IMAGE_PATH
+from .status import CommandStatus
+from .ui import (
     build_issue_embed,
     build_issue_list_embed,
     build_issue_list_view,
@@ -37,7 +37,7 @@ from ui import (
     build_series_embed,
     build_series_lookup_view,
 )
-from utils import db_call, log_elapsed, logger
+from .utils import db_call, log_elapsed, logger
 
 
 def create_issue_list_pages(issues) -> list[str]:
