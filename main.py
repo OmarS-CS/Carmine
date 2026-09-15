@@ -6,7 +6,7 @@ from discord.ext import commands
 import config
 from commands import register_commands
 from database import init_lookup_db
-from ui import IssueListPageButton, IssuePageButton
+from ui import IssueListPageButton, IssuePageButton, SeriesPageButton
 from utils import logger
 
 
@@ -22,6 +22,7 @@ class CarmineBot(commands.Bot):
         init_lookup_db()
         self.add_dynamic_items(IssuePageButton)
         self.add_dynamic_items(IssueListPageButton)
+        self.add_dynamic_items(SeriesPageButton)
         await self.tree.sync()
         logger.info(
             "Startup setup complete | dynamic items registered | slash commands synced"

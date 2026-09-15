@@ -88,6 +88,25 @@ def init_lookup_db() -> None:
             )
             """
         )
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS series_lookups (
+                lookup_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                matches_json TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS series_cache (
+                series_id INTEGER PRIMARY KEY,
+                details_json TEXT NOT NULL,
+                cached_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
 
 
 def _issue_series_name(series) -> str:
@@ -320,6 +339,75 @@ def store_cached_series_search(search_key: str, series_results):
         )
 
     return _deserialize_series_results(records)
+
+
+def create_series_lookup_record(user_id: int, series_results):
+    """Store series-search matches for persistent /series_lookup pagination."""
+    lookup_id = secrets.token_hex(8)
+    matches = _serialize_series_results(series_results)
+
+    with sqlite3.connect(DB_PATH) as db:
+        db.execute(
+            """
+            INSERT INTO series_lookups (lookup_id, user_id, matches_json)
+            VALUES (?, ?, ?)
+            """,
+            (lookup_id, user_id, json.dumps(matches)),
+        )
+
+    return lookup_id, matches
+
+
+def load_series_lookup_record(lookup_id: str):
+    """Load one persistent /series_lookup paginator record."""
+    with sqlite3.connect(DB_PATH) as db:
+        row = db.execute(
+            """
+            SELECT user_id, matches_json
+            FROM series_lookups
+            WHERE lookup_id = ?
+            """,
+            (lookup_id,),
+        ).fetchone()
+
+    if row is None:
+        return None
+
+    user_id, matches_json = row
+    return int(user_id), json.loads(matches_json)
+
+
+def load_cached_series(series_id: int):
+    """Load normalized series details from SQLite, if cached."""
+    with sqlite3.connect(DB_PATH) as db:
+        row = db.execute(
+            """
+            SELECT details_json
+            FROM series_cache
+            WHERE series_id = ?
+            """,
+            (series_id,),
+        ).fetchone()
+
+    if row is None:
+        return None
+
+    return json.loads(row[0])
+
+
+def store_cached_series(series_id: int, details: dict) -> None:
+    """Persist normalized series details for future /series_lookup pages."""
+    with sqlite3.connect(DB_PATH) as db:
+        db.execute(
+            """
+            INSERT INTO series_cache (series_id, details_json, cached_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(series_id) DO UPDATE SET
+                details_json = excluded.details_json,
+                cached_at = CURRENT_TIMESTAMP
+            """,
+            (series_id, json.dumps(details)),
+        )
 
 
 def _publisher_cache_key(publisher: str) -> str:

@@ -4,60 +4,317 @@ import time
 import traceback
 
 import discord
-from discord import Interaction, SelectOption
-from discord.ui import Select, View
+from discord import Interaction
+from discord.ui import View
 
-from database import load_issue_search_record, load_lookup_record
-from metron_service import get_issue_details, schedule_issue_prefetch
+from database import (
+    load_issue_search_record,
+    load_lookup_record,
+    load_series_lookup_record,
+)
+from metron_service import (
+    get_issue_details,
+    get_series_details,
+    schedule_issue_prefetch,
+    schedule_series_prefetch,
+)
 from settings import EMBED_COLOR, EMBED_DESCRIPTION_LIMIT, EMBED_FIELD_LIMIT
-from utils import db_call, log_elapsed, series_display_name, truncate
+from utils import db_call, log_elapsed, truncate
 
 
-class SeriesSelect(Select):
-    """Dropdown containing up to Discord's 25 allowed series choices."""
+async def build_series_embed(
+    match: dict,
+    current_page: int,
+    total_pages: int,
+) -> discord.Embed:
+    """Build one detailed series embed, using the persistent series cache."""
+    details = await get_series_details(int(match["id"]))
 
-    def __init__(self, series_results):
-        options = []
+    title = details.get("name") or match.get("display_name") or "Unknown series"
+    description = truncate(
+        details.get("description") or "No description available.",
+        EMBED_DESCRIPTION_LIMIT,
+    )
 
-        for series in series_results[:25]:
-            year_began = getattr(series, "year_began", None)
-            description_parts = []
+    embed = discord.Embed(
+        title=title,
+        url=details.get("resource_url"),
+        description=description,
+        color=EMBED_COLOR,
+    )
 
-            if year_began is not None:
-                description_parts.append(f"Started {year_began}")
+    embed.add_field(
+        name="Publisher",
+        value=details.get("publisher") or "Unknown",
+        inline=True,
+    )
+    embed.add_field(
+        name="Imprint",
+        value=details.get("imprint") or "None",
+        inline=True,
+    )
+    embed.add_field(
+        name="Series Type",
+        value=details.get("series_type") or "Unknown",
+        inline=True,
+    )
 
-            description_parts.append(f"Metron ID {series.id}")
+    status = details.get("status") or "Unknown"
+    if isinstance(status, str):
+        status = status.replace("_", " ").title()
 
-            options.append(
-                SelectOption(
-                    label=series_display_name(series)[:100],
-                    description=" • ".join(description_parts)[:100],
-                    value=str(series.id),
-                )
-            )
+    embed.add_field(name="Status", value=status, inline=True)
 
-        super().__init__(
-            placeholder="Select a comic series...",
-            min_values=1,
-            max_values=1,
-            options=options,
+    year_began = details.get("year_began")
+    year_end = details.get("year_end")
+    if year_began is None:
+        years = "Unknown"
+    elif year_end is not None:
+        years = f"{year_began}–{year_end}"
+    else:
+        years = str(year_began)
+
+    embed.add_field(name="Years", value=years, inline=True)
+    embed.add_field(
+        name="Volume",
+        value=(
+            str(details.get("volume"))
+            if details.get("volume") is not None
+            else "Unknown"
+        ),
+        inline=True,
+    )
+    embed.add_field(
+        name="Issues",
+        value=(
+            str(details.get("issue_count"))
+            if details.get("issue_count") is not None
+            else "Unknown"
+        ),
+        inline=True,
+    )
+
+    language = details.get("language")
+    if language:
+        embed.add_field(name="Language", value=str(language).upper(), inline=True)
+
+    genres = details.get("genres") or []
+    if genres:
+        embed.add_field(
+            name="Genres",
+            value=truncate(", ".join(genres), EMBED_FIELD_LIMIT),
+            inline=False,
         )
 
-    async def callback(self, interaction: Interaction) -> None:
-        selected_series_id = self.values[0]
+    alt_names = details.get("alt_names") or []
+    if alt_names:
+        embed.add_field(
+            name="Alternate Names",
+            value=truncate("\n".join(alt_names), EMBED_FIELD_LIMIT),
+            inline=False,
+        )
+
+    associated = details.get("associated") or []
+    if associated:
+        associated_names = [
+            item.get("name") or f"Series {item.get('id')}"
+            for item in associated
+        ]
+        embed.add_field(
+            name="Associated Series",
+            value=truncate("\n".join(associated_names), EMBED_FIELD_LIMIT),
+            inline=False,
+        )
+
+    external_ids = []
+    if details.get("cv_id") is not None:
+        external_ids.append(f"Comic Vine: {details['cv_id']}")
+    if details.get("gcd_id") is not None:
+        external_ids.append(f"GCD: {details['gcd_id']}")
+    if external_ids:
+        embed.add_field(
+            name="External IDs",
+            value=" • ".join(external_ids),
+            inline=False,
+        )
+
+    embed.set_footer(
+        text=f"Match {current_page + 1}/{total_pages} • Metron ID: {match['id']}"
+    )
+    return embed
+
+
+class SeriesPageButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=(
+        r"carmine:series:"
+        r"(?P<lookup_id>[0-9a-f]{16}):"
+        r"(?P<page>[0-9]+):"
+        r"(?P<direction>prev|next):"
+        r"(?P<user_id>[0-9]+)"
+    ),
+):
+    """Persistent Previous/Next button for detailed /series_lookup results."""
+
+    def __init__(
+        self,
+        lookup_id: str,
+        page: int,
+        direction: str,
+        user_id: int,
+        *,
+        disabled: bool = False,
+    ):
+        if direction == "prev":
+            label = "Previous"
+            emoji = "◀️"
+        else:
+            label = "Next"
+            emoji = "▶️"
+
+        custom_id = f"carmine:series:{lookup_id}:{page}:{direction}:{user_id}"
+        super().__init__(
+            discord.ui.Button(
+                label=label,
+                emoji=emoji,
+                style=discord.ButtonStyle.secondary,
+                custom_id=custom_id,
+                disabled=disabled,
+            )
+        )
+        self.lookup_id = lookup_id
+        self.page = page
+        self.direction = direction
+        self.user_id = user_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        """Reconstruct a series paginator button from its custom ID."""
+        return cls(
+            lookup_id=match["lookup_id"],
+            page=int(match["page"]),
+            direction=match["direction"],
+            user_id=int(match["user_id"]),
+            disabled=item.disabled,
+        )
+
+    async def interaction_check(self, interaction: Interaction) -> bool:
+        """Allow only the user who created the lookup to control it."""
+        if interaction.user.id == self.user_id:
+            return True
+
         await interaction.response.send_message(
-            f"You selected series ID `{selected_series_id}`.\n"
-            "Please now use `/issue_lookup` to look up an issue.",
+            "Only the person who ran this lookup can use these buttons.",
             ephemeral=True,
         )
+        return False
+
+    async def callback(self, interaction: Interaction) -> None:
+        """Load the requested series page and update the original message."""
+        page_started = time.perf_counter()
+        page_context = {
+            "lookup_id": self.lookup_id,
+            "page": self.page + 1,
+            "direction": self.direction,
+        }
+        await interaction.response.defer()
+
+        try:
+            record = await db_call(
+                "series lookup read",
+                load_series_lookup_record,
+                self.lookup_id,
+                context={"lookup_id": self.lookup_id},
+            )
+
+            if record is None:
+                await interaction.followup.send(
+                    "This series lookup is no longer stored by Carmine.",
+                    ephemeral=True,
+                )
+                return
+
+            stored_user_id, matches = record
+
+            if interaction.user.id != stored_user_id:
+                await interaction.followup.send(
+                    "Only the person who ran this lookup can use these buttons.",
+                    ephemeral=True,
+                )
+                return
+
+            if not 0 <= self.page < len(matches):
+                await interaction.followup.send(
+                    "That series page no longer exists.",
+                    ephemeral=True,
+                )
+                return
+
+            embed = await build_series_embed(
+                matches[self.page],
+                self.page,
+                len(matches),
+            )
+            view = build_series_lookup_view(
+                self.lookup_id,
+                self.page,
+                len(matches),
+                stored_user_id,
+            )
+
+            await interaction.edit_original_response(embed=embed, view=view)
+            schedule_series_prefetch(matches, self.page, self.direction)
+
+        except Exception as exc:
+            traceback.print_exc()
+            await interaction.followup.send(
+                f"An error occurred while changing series pages: {exc}",
+                ephemeral=True,
+            )
+        finally:
+            log_elapsed(
+                "UI",
+                "/series_lookup page change",
+                page_started,
+                context=page_context,
+            )
 
 
-class SeriesView(View):
-    """Temporary view used by /series_lookup."""
+def build_series_lookup_view(
+    lookup_id: str,
+    current_page: int,
+    total_pages: int,
+    user_id: int,
+) -> View:
+    """Build persistent Previous/Next controls for a series lookup."""
+    view = View(timeout=None)
 
-    def __init__(self, series_results):
-        super().__init__(timeout=60)
-        self.add_item(SeriesSelect(series_results))
+    if total_pages <= 1:
+        return view
+
+    previous_page = max(0, current_page - 1)
+    next_page = min(total_pages - 1, current_page + 1)
+
+    view.add_item(
+        SeriesPageButton(
+            lookup_id,
+            previous_page,
+            "prev",
+            user_id,
+            disabled=current_page == 0,
+        )
+    )
+    view.add_item(
+        SeriesPageButton(
+            lookup_id,
+            next_page,
+            "next",
+            user_id,
+            disabled=current_page == total_pages - 1,
+        )
+    )
+
+    return view
 
 
 async def build_issue_embed(

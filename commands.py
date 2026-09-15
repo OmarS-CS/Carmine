@@ -11,6 +11,7 @@ from discord.ext import commands
 from database import (
     create_issue_search_record,
     create_lookup_record_from_matches,
+    create_series_lookup_record,
     issue_lookup_search_key,
     load_cached_issue_lookup_search,
     load_cached_issue_year,
@@ -20,15 +21,21 @@ from database import (
     store_cached_issue_year,
     store_cached_series_search,
 )
-from metron_service import metron, metron_call, schedule_issue_prefetch
+from metron_service import (
+    metron,
+    metron_call,
+    schedule_issue_prefetch,
+    schedule_series_prefetch,
+)
 from settings import EMBED_COLOR, ISSUE_LIST_PAGE_LIMIT, SUPERMAN_IMAGE_PATH
 from status import CommandStatus
 from ui import (
-    SeriesView,
     build_issue_embed,
     build_issue_list_embed,
     build_issue_list_view,
     build_issue_lookup_view,
+    build_series_embed,
+    build_series_lookup_view,
 )
 from utils import db_call, log_elapsed, logger
 
@@ -353,13 +360,13 @@ def register_commands(bot: commands.Bot) -> None:
 
     @bot.tree.command(
         name="series_lookup",
-        description="Search for a comic series title.",
+        description="Look up comic series information on Metron.",
     )
     @app_commands.describe(name="The name of the comic series")
     async def series_lookup(interaction: Interaction, name: str) -> None:
         command_started = time.perf_counter()
         command_context = {"name": name}
-        status = CommandStatus(interaction, ephemeral=True)
+        status = CommandStatus(interaction)
 
         await status.start(
             "🔎 **Searching for comic series...**\n"
@@ -403,21 +410,36 @@ def register_commands(bot: commands.Bot) -> None:
                 )
 
             if not series_results:
-                await status.finish(content="No matching comic series found.")
+                await status.fail_ephemeral("No matching comic series found.")
                 return
 
-            view = SeriesView(series_results)
-            await status.finish(
-                content=(
-                    f"Found **{len(series_results)}** matching series. "
-                    "Select the one you're looking for:"
-                ),
-                view=view,
+            await status.update(
+                f"📚 **Found {len(series_results)} matching series.**\n"
+                "Loading series details..."
             )
+
+            lookup_id, matches = await db_call(
+                "series lookup write",
+                create_series_lookup_record,
+                interaction.user.id,
+                series_results,
+                context={**command_context, "matches": len(series_results)},
+            )
+
+            embed = await build_series_embed(matches[0], 0, len(matches))
+            view = build_series_lookup_view(
+                lookup_id,
+                0,
+                len(matches),
+                interaction.user.id,
+            )
+
+            await status.finish(embed=embed, view=view)
+            schedule_series_prefetch(matches, 0, "next")
 
         except Exception as exc:
             traceback.print_exc()
-            await status.error(f"An error occurred: {exc}")
+            await status.fail_ephemeral(f"An error occurred: {exc}")
         finally:
             log_elapsed(
                 "COMMAND",
@@ -604,7 +626,10 @@ def register_commands(bot: commands.Bot) -> None:
         )
         embed.add_field(
             name="/series_lookup",
-            value="Search Metron for comic series by name.",
+            value=(
+                "Look up a comic series and browse detailed information for "
+                "matching runs."
+            ),
             inline=False,
         )
         embed.add_field(

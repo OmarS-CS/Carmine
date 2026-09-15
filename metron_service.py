@@ -7,7 +7,12 @@ import traceback
 import mokkari
 
 import config
-from database import load_cached_issue, store_cached_issue
+from database import (
+    load_cached_issue,
+    load_cached_series,
+    store_cached_issue,
+    store_cached_series,
+)
 from settings import METRON_MAX_CONCURRENCY
 from utils import _format_log_context, db_call, display_name, logger, run_blocking
 
@@ -17,6 +22,7 @@ metron = mokkari.api(config.username, config.password)
 _metron_semaphore = asyncio.Semaphore(METRON_MAX_CONCURRENCY)
 _background_tasks: set[asyncio.Task] = set()
 _issue_fetch_tasks: dict[int, asyncio.Task] = {}
+_series_fetch_tasks: dict[int, asyncio.Task] = {}
 
 
 async def metron_call(
@@ -138,6 +144,127 @@ async def get_issue_details(issue_id: int) -> dict:
     finally:
         if _issue_fetch_tasks.get(issue_id) is task:
             del _issue_fetch_tasks[issue_id]
+
+
+def normalize_series_details(series) -> dict:
+    """Convert a Mokkari series-detail object into JSON-safe embed data."""
+    genres = getattr(series, "genres", None) or []
+    associated = getattr(series, "associated", None) or []
+    alt_names = getattr(series, "alt_names", None) or []
+
+    normalized_associated = []
+    for item in associated:
+        item_id = getattr(item, "id", None)
+        item_name = display_name(item)
+        normalized_associated.append(
+            {
+                "id": int(item_id) if item_id is not None else None,
+                "name": item_name,
+            }
+        )
+
+    resource_url = getattr(series, "resource_url", None)
+    publisher = getattr(series, "publisher", None)
+    imprint = getattr(series, "imprint", None)
+    series_type = getattr(series, "series_type", None)
+
+    return {
+        "id": int(series.id),
+        "name": str(getattr(series, "name", None) or display_name(series)),
+        "sort_name": str(getattr(series, "sort_name", None) or ""),
+        "publisher": display_name(publisher),
+        "imprint": display_name(imprint, "") if imprint is not None else None,
+        "series_type": display_name(series_type),
+        "status": str(getattr(series, "status", None) or "Unknown"),
+        "year_began": getattr(series, "year_began", None),
+        "year_end": getattr(series, "year_end", None),
+        "volume": getattr(series, "volume", None),
+        "issue_count": getattr(series, "issue_count", None),
+        "description": str(
+            getattr(series, "desc", None) or "No description available."
+        ).strip(),
+        "genres": [display_name(genre) for genre in genres],
+        "associated": normalized_associated,
+        "alt_names": [str(name) for name in alt_names],
+        "language": getattr(series, "language", None),
+        "cv_id": getattr(series, "cv_id", None),
+        "gcd_id": getattr(series, "gcd_id", None),
+        "resource_url": str(resource_url) if resource_url else None,
+    }
+
+
+async def get_series_details(series_id: int) -> dict:
+    """Return cached series details, fetching Metron only on a cache miss."""
+    cached = await db_call(
+        "series cache read",
+        load_cached_series,
+        series_id,
+        context={"series_id": series_id},
+    )
+    if cached is not None:
+        logger.info("[CACHE] series detail hit | series_id=%s", series_id)
+        return cached
+
+    logger.info("[CACHE] series detail miss | series_id=%s", series_id)
+
+    existing_task = _series_fetch_tasks.get(series_id)
+    if existing_task is not None:
+        logger.info(
+            "[CACHE] awaiting in-flight series fetch | series_id=%s",
+            series_id,
+        )
+        return await existing_task
+
+    async def fetch_and_cache() -> dict:
+        series = await metron_call(
+            "series details",
+            metron.series,
+            series_id,
+            context={"series_id": series_id},
+        )
+        details = normalize_series_details(series)
+        await db_call(
+            "series cache write",
+            store_cached_series,
+            series_id,
+            details,
+            context={"series_id": series_id},
+        )
+        return details
+
+    task = asyncio.create_task(fetch_and_cache())
+    _series_fetch_tasks[series_id] = task
+
+    try:
+        return await task
+    finally:
+        if _series_fetch_tasks.get(series_id) is task:
+            del _series_fetch_tasks[series_id]
+
+
+def schedule_series_prefetch(
+    matches: list[dict],
+    current_page: int,
+    direction: str = "next",
+) -> None:
+    """Prefetch one neighboring series-detail page in the background."""
+    offset = -1 if direction == "prev" else 1
+    target_page = current_page + offset
+
+    if not 0 <= target_page < len(matches):
+        return
+
+    series_id = int(matches[target_page]["id"])
+
+    async def prefetch() -> None:
+        try:
+            await get_series_details(series_id)
+        except Exception:
+            traceback.print_exc()
+
+    task = asyncio.create_task(prefetch())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 def schedule_issue_prefetch(
