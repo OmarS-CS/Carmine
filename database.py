@@ -18,6 +18,15 @@ class IssueListEntry:
     cover_date: date | None
 
 
+@dataclass(frozen=True)
+class SeriesSearchEntry:
+    """Lightweight series data used by the /series_lookup search cache."""
+
+    id: int
+    display_name: str
+    year_began: int | None
+
+
 def init_lookup_db() -> None:
     """Create Carmine's persistent tables if they do not already exist."""
     with sqlite3.connect(DB_PATH) as db:
@@ -61,10 +70,48 @@ def init_lookup_db() -> None:
             )
             """
         )
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS issue_lookup_search_cache (
+                search_key TEXT PRIMARY KEY,
+                matches_json TEXT NOT NULL,
+                cached_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS series_search_cache (
+                search_key TEXT PRIMARY KEY,
+                results_json TEXT NOT NULL,
+                cached_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
 
 
-def create_lookup_record(user_id: int, issue_results):
-    """Store lightweight Metron search results and return their lookup ID."""
+def _issue_series_name(series) -> str:
+    """Extract a readable series title from Mokkari issue-list models."""
+    if series is None:
+        return "Unknown series"
+
+    for attribute in ("name", "display_name", "series_name", "title", "sort_name"):
+        value = getattr(series, attribute, None)
+        if value:
+            return str(value)
+
+    if hasattr(series, "model_dump"):
+        data = series.model_dump(by_alias=True)
+        for key in ("series", "name", "series_name", "title", "sort_name"):
+            value = data.get(key)
+            if value:
+                return str(value)
+
+    return "Unknown series"
+
+
+def serialize_issue_lookup_results(issue_results) -> list[dict]:
+    """Normalize Mokkari issue search results into persistent lightweight matches."""
     matches = []
 
     for result in issue_results:
@@ -74,11 +121,16 @@ def create_lookup_record(user_id: int, issue_results):
         matches.append(
             {
                 "id": int(result.id),
-                "series_name": str(getattr(series, "name", "Unknown series")),
+                "series_name": _issue_series_name(series),
                 "year_began": str(year_began) if year_began is not None else None,
             }
         )
 
+    return matches
+
+
+def create_lookup_record_from_matches(user_id: int, matches: list[dict]):
+    """Store an already-normalized issue lookup for persistent pagination."""
     lookup_id = secrets.token_hex(8)
 
     with sqlite3.connect(DB_PATH) as db:
@@ -91,6 +143,14 @@ def create_lookup_record(user_id: int, issue_results):
         )
 
     return lookup_id, matches
+
+
+def create_lookup_record(user_id: int, issue_results):
+    """Store lightweight Metron search results and return their lookup ID."""
+    return create_lookup_record_from_matches(
+        user_id,
+        serialize_issue_lookup_results(issue_results),
+    )
 
 
 def load_lookup_record(lookup_id: str):
@@ -110,6 +170,156 @@ def load_lookup_record(lookup_id: str):
 
     user_id, matches_json = row
     return int(user_id), json.loads(matches_json)
+
+
+def _normalized_search_text(value: str | None) -> str:
+    """Normalize optional user-entered search text for stable cache keys."""
+    return value.strip().casefold() if value else ""
+
+
+def issue_lookup_search_key(
+    series: str,
+    issue_number: str,
+    year: int | None,
+    publisher: str | None,
+) -> str:
+    """Build a deterministic key for one /issue_lookup search."""
+    return json.dumps(
+        {
+            "series": _normalized_search_text(series),
+            "issue_number": _normalized_search_text(issue_number),
+            "year": year,
+            "publisher": _normalized_search_text(publisher),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def load_cached_issue_lookup_search(search_key: str):
+    """Load cached normalized matches for an /issue_lookup search, if present."""
+    with sqlite3.connect(DB_PATH) as db:
+        row = db.execute(
+            """
+            SELECT matches_json
+            FROM issue_lookup_search_cache
+            WHERE search_key = ?
+            """,
+            (search_key,),
+        ).fetchone()
+
+    if row is None:
+        return None
+
+    return json.loads(row[0])
+
+
+def store_cached_issue_lookup_search(search_key: str, issue_results) -> list[dict]:
+    """Cache normalized /issue_lookup search matches indefinitely."""
+    matches = serialize_issue_lookup_results(issue_results)
+
+    with sqlite3.connect(DB_PATH) as db:
+        db.execute(
+            """
+            INSERT INTO issue_lookup_search_cache (search_key, matches_json, cached_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(search_key) DO UPDATE SET
+                matches_json = excluded.matches_json,
+                cached_at = CURRENT_TIMESTAMP
+            """,
+            (search_key, json.dumps(matches)),
+        )
+
+    return matches
+
+
+def series_search_key(name: str) -> str:
+    """Build a case-insensitive cache key for /series_lookup."""
+    return _normalized_search_text(name)
+
+
+def _serialize_series_results(series_results) -> list[dict]:
+    """Normalize Mokkari series search results for persistent caching."""
+    records = []
+
+    for series in series_results:
+        display_name = None
+        for attribute in ("display_name", "name", "series_name", "title", "sort_name"):
+            value = getattr(series, attribute, None)
+            if value:
+                display_name = str(value)
+                break
+
+        if display_name is None and hasattr(series, "model_dump"):
+            data = series.model_dump(by_alias=True)
+            for key in ("series", "name", "series_name", "title", "sort_name"):
+                value = data.get(key)
+                if value:
+                    display_name = str(value)
+                    break
+
+        records.append(
+            {
+                "id": int(series.id),
+                "display_name": display_name or f"Series {series.id}",
+                "year_began": getattr(series, "year_began", None),
+            }
+        )
+
+    return records
+
+
+def _deserialize_series_results(records: list[dict]) -> list[SeriesSearchEntry]:
+    """Rebuild cached series entries for the Discord dropdown."""
+    return [
+        SeriesSearchEntry(
+            id=int(record["id"]),
+            display_name=str(record["display_name"]),
+            year_began=(
+                int(record["year_began"])
+                if record.get("year_began") is not None
+                else None
+            ),
+        )
+        for record in records
+    ]
+
+
+def load_cached_series_search(search_key: str):
+    """Load cached /series_lookup results, including cached empty searches."""
+    with sqlite3.connect(DB_PATH) as db:
+        row = db.execute(
+            """
+            SELECT results_json
+            FROM series_search_cache
+            WHERE search_key = ?
+            """,
+            (search_key,),
+        ).fetchone()
+
+    if row is None:
+        return None
+
+    return _deserialize_series_results(json.loads(row[0]))
+
+
+def store_cached_series_search(search_key: str, series_results):
+    """Cache /series_lookup results indefinitely and return lightweight entries."""
+    records = _serialize_series_results(series_results)
+
+    with sqlite3.connect(DB_PATH) as db:
+        db.execute(
+            """
+            INSERT INTO series_search_cache (search_key, results_json, cached_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(search_key) DO UPDATE SET
+                results_json = excluded.results_json,
+                cached_at = CURRENT_TIMESTAMP
+            """,
+            (search_key, json.dumps(records)),
+        )
+
+    return _deserialize_series_results(records)
 
 
 def _publisher_cache_key(publisher: str) -> str:

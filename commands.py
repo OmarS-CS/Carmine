@@ -10,9 +10,15 @@ from discord.ext import commands
 
 from database import (
     create_issue_search_record,
-    create_lookup_record,
+    create_lookup_record_from_matches,
+    issue_lookup_search_key,
+    load_cached_issue_lookup_search,
     load_cached_issue_year,
+    load_cached_series_search,
+    series_search_key,
+    store_cached_issue_lookup_search,
     store_cached_issue_year,
+    store_cached_series_search,
 )
 from metron_service import metron, metron_call, schedule_issue_prefetch
 from settings import EMBED_COLOR, ISSUE_LIST_PAGE_LIMIT, SUPERMAN_IMAGE_PATH
@@ -356,17 +362,45 @@ def register_commands(bot: commands.Bot) -> None:
         status = CommandStatus(interaction, ephemeral=True)
 
         await status.start(
-            "🔎 **Searching Metron for comic series...**\n"
+            "🔎 **Searching for comic series...**\n"
             f"Looking for titles matching **{name}**."
         )
 
         try:
-            series_results = await metron_call(
-                "series list",
-                metron.series_list,
-                {"name": name},
+            search_key = series_search_key(name)
+            series_results = await db_call(
+                "series search cache read",
+                load_cached_series_search,
+                search_key,
                 context=command_context,
             )
+
+            if series_results is None:
+                logger.info("[CACHE] series search miss | name=%s", name)
+                await status.update(
+                    "⏳ **Searching Metron for comic series...**\n"
+                    f"Looking for titles matching **{name}**."
+                )
+
+                metron_results = await metron_call(
+                    "series list",
+                    metron.series_list,
+                    {"name": name},
+                    context=command_context,
+                )
+                series_results = await db_call(
+                    "series search cache write",
+                    store_cached_series_search,
+                    search_key,
+                    metron_results,
+                    context={**command_context, "matches": len(metron_results)},
+                )
+            else:
+                logger.info(
+                    "[CACHE] series search hit | name=%s, matches=%s",
+                    name,
+                    len(series_results),
+                )
 
             if not series_results:
                 await status.finish(content="No matching comic series found.")
@@ -438,47 +472,91 @@ def register_commands(bot: commands.Bot) -> None:
         )
 
         await status.start(
-            "🔎 **Searching Metron for an issue...**\n"
+            "🔎 **Searching for an issue...**\n"
             f"**{series} #{issue_number}**{filter_text}"
         )
 
         try:
-            filters = {
-                "series_name": series,
-                "number": issue_number,
-            }
-
-            if year is not None:
-                filters["series_year_began"] = year
-
-            if publisher:
-                filters["publisher_name"] = publisher
-
-            issue_results = list(
-                await metron_call(
-                    "issue lookup search",
-                    metron.issues_list,
-                    filters,
-                    context=command_context,
-                )
+            search_key = issue_lookup_search_key(
+                series,
+                issue_number,
+                year,
+                publisher,
+            )
+            matches = await db_call(
+                "issue lookup search cache read",
+                load_cached_issue_lookup_search,
+                search_key,
+                context=command_context,
             )
 
-            if not issue_results:
+            if matches is None:
+                logger.info(
+                    "[CACHE] issue lookup search miss | series=%s, issue_number=%s, "
+                    "year=%s, publisher=%s",
+                    series,
+                    issue_number,
+                    year,
+                    publisher,
+                )
+                await status.update(
+                    "⏳ **Searching Metron for an issue...**\n"
+                    f"**{series} #{issue_number}**{filter_text}"
+                )
+
+                filters = {
+                    "series_name": series,
+                    "number": issue_number,
+                }
+
+                if year is not None:
+                    filters["series_year_began"] = year
+
+                if publisher:
+                    filters["publisher_name"] = publisher
+
+                issue_results = list(
+                    await metron_call(
+                        "issue lookup search",
+                        metron.issues_list,
+                        filters,
+                        context=command_context,
+                    )
+                )
+                matches = await db_call(
+                    "issue lookup search cache write",
+                    store_cached_issue_lookup_search,
+                    search_key,
+                    issue_results,
+                    context={**command_context, "matches": len(issue_results)},
+                )
+            else:
+                logger.info(
+                    "[CACHE] issue lookup search hit | series=%s, issue_number=%s, "
+                    "year=%s, publisher=%s, matches=%s",
+                    series,
+                    issue_number,
+                    year,
+                    publisher,
+                    len(matches),
+                )
+
+            if not matches:
                 await status.fail_ephemeral("No matching issues were found.")
                 return
 
             await status.update(
-                f"📚 **Found {len(issue_results)} matching issue"
-                f"{'s' if len(issue_results) != 1 else ''}.**\n"
+                f"📚 **Found {len(matches)} matching issue"
+                f"{'s' if len(matches) != 1 else ''}.**\n"
                 "Loading issue details..."
             )
 
             lookup_id, matches = await db_call(
                 "issue lookup write",
-                create_lookup_record,
+                create_lookup_record_from_matches,
                 interaction.user.id,
-                issue_results,
-                context={"matches": len(issue_results)},
+                matches,
+                context={"matches": len(matches)},
             )
 
             embed = await build_issue_embed(matches[0], 0, len(matches))
