@@ -11,7 +11,7 @@ from .settings import DB_PATH
 
 @dataclass(frozen=True)
 class IssueListEntry:
-    """Lightweight issue data used by /issues and its cover-year cache."""
+    """Lightweight issue data used by /issue_search and its cover-year cache."""
 
     id: int
     issue_name: str
@@ -25,6 +25,24 @@ class SeriesSearchEntry:
     id: int
     display_name: str
     year_began: int | None
+
+
+@dataclass(frozen=True)
+class ResourceSearchEntry:
+    """Lightweight named Metron resource used by creator/character searches."""
+
+    id: int
+    name: str
+
+
+@dataclass(frozen=True)
+class EntityIssueEntry:
+    """Lightweight issue data cached for creator/character issue lists."""
+
+    id: int
+    issue_name: str
+    cover_date: date | None
+    store_date: date | None
 
 
 def init_lookup_db() -> None:
@@ -76,11 +94,39 @@ def init_lookup_db() -> None:
             CREATE TABLE IF NOT EXISTS issue_searches (
                 search_id TEXT PRIMARY KEY,
                 date_label TEXT NOT NULL,
+                query_text TEXT NOT NULL DEFAULT '',
                 pages_json TEXT NOT NULL,
+                page_entries_json TEXT NOT NULL DEFAULT '[]',
+                creator_ids_json TEXT NOT NULL DEFAULT '[]',
+                creator_names_json TEXT NOT NULL DEFAULT '[]',
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
+        issue_search_columns = {
+            row[1] for row in db.execute("PRAGMA table_info(issue_searches)")
+        }
+        if "query_text" not in issue_search_columns:
+            db.execute(
+                "ALTER TABLE issue_searches "
+                "ADD COLUMN query_text TEXT NOT NULL DEFAULT ''"
+            )
+        if "page_entries_json" not in issue_search_columns:
+            db.execute(
+                "ALTER TABLE issue_searches "
+                "ADD COLUMN page_entries_json TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "creator_ids_json" not in issue_search_columns:
+            db.execute(
+                "ALTER TABLE issue_searches "
+                "ADD COLUMN creator_ids_json TEXT NOT NULL DEFAULT '[]'"
+            )
+        if "creator_names_json" not in issue_search_columns:
+            db.execute(
+                "ALTER TABLE issue_searches "
+                "ADD COLUMN creator_names_json TEXT NOT NULL DEFAULT '[]'"
+            )
+
         db.execute(
             """
             CREATE TABLE IF NOT EXISTS issue_lookup_search_cache (
@@ -113,6 +159,37 @@ def init_lookup_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS series_cache (
                 series_id INTEGER PRIMARY KEY,
+                details_json TEXT NOT NULL,
+                cached_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS resource_search_cache (
+                resource_type TEXT NOT NULL,
+                search_key TEXT NOT NULL,
+                results_json TEXT NOT NULL,
+                cached_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (resource_type, search_key)
+            )
+            """
+        )
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS entity_issue_cache (
+                entity_type TEXT NOT NULL,
+                entity_id INTEGER NOT NULL,
+                issues_json TEXT NOT NULL,
+                cached_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (entity_type, entity_id)
+            )
+            """
+        )
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS character_cache (
+                character_id INTEGER PRIMARY KEY,
                 details_json TEXT NOT NULL,
                 cached_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
@@ -454,7 +531,7 @@ def _serialize_issue_year_results(issue_results) -> list[dict]:
 
 
 def _deserialize_issue_year_results(records: list[dict]) -> list[IssueListEntry]:
-    """Rebuild lightweight /issues entries from cached JSON records."""
+    """Rebuild lightweight /issue_search entries from cached JSON records."""
     return [
         IssueListEntry(
             id=int(record["id"]),
@@ -516,13 +593,33 @@ def store_cached_issue_year(
 def issue_year_search_key(
     publisher: str | None,
     title: str | None,
+    *,
+    creator_ids: list[int] | None = None,
+    character_ids: list[int] | None = None,
+    publisher_id: int | None = None,
+    series_id: int | None = None,
 ) -> str:
-    """Build a stable key for flexible /issues cover-year searches."""
+    """Build a stable key for flexible /issue_search cover-year searches.
+
+    Keep the legacy publisher/title-only key shape whenever no exact resource ID
+    has been selected so previously cached searches remain reusable.
+    """
+    payload = {
+        "publisher": _normalized_search_text(publisher),
+        "title": _normalized_search_text(title),
+    }
+
+    if creator_ids:
+        payload["creator_ids"] = sorted(set(creator_ids))
+    if character_ids:
+        payload["character_ids"] = sorted(set(character_ids))
+    if publisher_id is not None:
+        payload["publisher_id"] = int(publisher_id)
+    if series_id is not None:
+        payload["series_id"] = int(series_id)
+
     return json.dumps(
-        {
-            "publisher": _normalized_search_text(publisher),
-            "title": _normalized_search_text(title),
-        },
+        payload,
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -532,7 +629,7 @@ def load_cached_issue_year_search(
     search_key: str,
     cover_year: int,
 ):
-    """Load one flexible /issues cover-year query from SQLite, if cached."""
+    """Load one flexible /issue_search cover-year query from SQLite, if cached."""
     with sqlite3.connect(DB_PATH) as db:
         row = db.execute(
             """
@@ -554,7 +651,7 @@ def store_cached_issue_year_search(
     cover_year: int,
     issue_results,
 ) -> list[IssueListEntry]:
-    """Persist one flexible /issues cover-year query indefinitely."""
+    """Persist one flexible /issue_search cover-year query indefinitely."""
     records = _serialize_issue_year_results(issue_results)
 
     with sqlite3.connect(DB_PATH) as db:
@@ -573,28 +670,46 @@ def store_cached_issue_year_search(
     return _deserialize_issue_year_results(records)
 
 
-def create_issue_search_record(date_label: str, pages: list[str]) -> str:
-    """Store rendered /issues pages so persistent buttons can restore them."""
+def create_issue_search_record(
+    date_label: str,
+    query_text: str,
+    pages: list[str],
+    page_entries: list[list[dict]] | None = None,
+    creator_ids: list[int] | None = None,
+    creator_names: list[str] | None = None,
+) -> str:
+    """Store /issue_search pages and legacy pagination metadata."""
     search_id = secrets.token_hex(8)
 
     with sqlite3.connect(DB_PATH) as db:
         db.execute(
             """
-            INSERT INTO issue_searches (search_id, date_label, pages_json)
-            VALUES (?, ?, ?)
+            INSERT INTO issue_searches
+                (search_id, date_label, query_text, pages_json, page_entries_json,
+                 creator_ids_json, creator_names_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (search_id, date_label, json.dumps(pages)),
+            (
+                search_id,
+                date_label,
+                query_text,
+                json.dumps(pages),
+                json.dumps(page_entries or []),
+                json.dumps(creator_ids or []),
+                json.dumps(creator_names or []),
+            ),
         )
 
     return search_id
 
 
 def load_issue_search_record(search_id: str):
-    """Load a stored /issues paginator by its persistent search ID."""
+    """Load a stored /issue_search paginator by its persistent search ID."""
     with sqlite3.connect(DB_PATH) as db:
         row = db.execute(
             """
-            SELECT date_label, pages_json
+            SELECT date_label, query_text, pages_json, page_entries_json,
+                   creator_ids_json, creator_names_json
             FROM issue_searches
             WHERE search_id = ?
             """,
@@ -604,8 +719,22 @@ def load_issue_search_record(search_id: str):
     if row is None:
         return None
 
-    date_label, pages_json = row
-    return date_label, json.loads(pages_json)
+    (
+        date_label,
+        query_text,
+        pages_json,
+        page_entries_json,
+        creator_ids_json,
+        creator_names_json,
+    ) = row
+    return (
+        date_label,
+        query_text,
+        json.loads(pages_json),
+        json.loads(page_entries_json or "[]"),
+        json.loads(creator_ids_json or "[]"),
+        json.loads(creator_names_json or "[]"),
+    )
 
 
 def load_cached_issue(issue_id: int):
@@ -639,3 +768,173 @@ def store_cached_issue(issue_id: int, details: dict) -> None:
             """,
             (issue_id, json.dumps(details)),
         )
+
+def resource_search_key(name: str) -> str:
+    """Build a stable case-insensitive key for creator/character name searches."""
+    return _normalized_search_text(name)
+
+
+def _serialize_resource_results(results) -> list[dict]:
+    """Normalize named Metron list results for persistent search caching."""
+    return [
+        {
+            "id": int(item.id),
+            "name": str(getattr(item, "name", None) or f"Resource {item.id}"),
+        }
+        for item in results
+    ]
+
+
+def _deserialize_resource_results(records: list[dict]) -> list[ResourceSearchEntry]:
+    """Rebuild cached named-resource search results."""
+    return [
+        ResourceSearchEntry(id=int(record["id"]), name=str(record["name"]))
+        for record in records
+    ]
+
+
+def load_cached_resource_search(resource_type: str, search_key: str):
+    """Load cached creator/character search results, including empty searches."""
+    with sqlite3.connect(DB_PATH) as db:
+        row = db.execute(
+            """
+            SELECT results_json
+            FROM resource_search_cache
+            WHERE resource_type = ? AND search_key = ?
+            """,
+            (resource_type, search_key),
+        ).fetchone()
+
+    if row is None:
+        return None
+
+    return _deserialize_resource_results(json.loads(row[0]))
+
+
+def store_cached_resource_search(resource_type: str, search_key: str, results):
+    """Persist creator/character name-search results indefinitely."""
+    records = _serialize_resource_results(results)
+
+    with sqlite3.connect(DB_PATH) as db:
+        db.execute(
+            """
+            INSERT INTO resource_search_cache
+                (resource_type, search_key, results_json, cached_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(resource_type, search_key) DO UPDATE SET
+                results_json = excluded.results_json,
+                cached_at = CURRENT_TIMESTAMP
+            """,
+            (resource_type, search_key, json.dumps(records)),
+        )
+
+    return _deserialize_resource_results(records)
+
+
+def _serialize_entity_issues(issue_results) -> list[dict]:
+    """Normalize issue-list results for creator/character caches."""
+    records = []
+    for issue in issue_results:
+        cover_date = getattr(issue, "cover_date", None)
+        store_date = getattr(issue, "store_date", None)
+        records.append(
+            {
+                "id": int(issue.id),
+                "issue_name": str(
+                    getattr(issue, "issue_name", f"Issue {issue.id}")
+                ),
+                "cover_date": cover_date.isoformat() if cover_date else None,
+                "store_date": store_date.isoformat() if store_date else None,
+            }
+        )
+    return records
+
+
+def _deserialize_entity_issues(records: list[dict]) -> list[EntityIssueEntry]:
+    """Rebuild cached creator/character issue-list entries."""
+    return [
+        EntityIssueEntry(
+            id=int(record["id"]),
+            issue_name=str(record["issue_name"]),
+            cover_date=(
+                date.fromisoformat(record["cover_date"])
+                if record.get("cover_date")
+                else None
+            ),
+            store_date=(
+                date.fromisoformat(record["store_date"])
+                if record.get("store_date")
+                else None
+            ),
+        )
+        for record in records
+    ]
+
+
+def load_cached_entity_issues(entity_type: str, entity_id: int):
+    """Load the full cached issue list for one creator or character."""
+    with sqlite3.connect(DB_PATH) as db:
+        row = db.execute(
+            """
+            SELECT issues_json
+            FROM entity_issue_cache
+            WHERE entity_type = ? AND entity_id = ?
+            """,
+            (entity_type, entity_id),
+        ).fetchone()
+
+    if row is None:
+        return None
+
+    return _deserialize_entity_issues(json.loads(row[0]))
+
+
+def store_cached_entity_issues(entity_type: str, entity_id: int, issue_results):
+    """Persist the complete issue list for one creator or character."""
+    records = _serialize_entity_issues(issue_results)
+
+    with sqlite3.connect(DB_PATH) as db:
+        db.execute(
+            """
+            INSERT INTO entity_issue_cache
+                (entity_type, entity_id, issues_json, cached_at)
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(entity_type, entity_id) DO UPDATE SET
+                issues_json = excluded.issues_json,
+                cached_at = CURRENT_TIMESTAMP
+            """,
+            (entity_type, entity_id, json.dumps(records)),
+        )
+
+    return _deserialize_entity_issues(records)
+
+
+def load_cached_character(character_id: int):
+    """Load normalized character details used for universe-aware dropdowns."""
+    with sqlite3.connect(DB_PATH) as db:
+        row = db.execute(
+            """
+            SELECT details_json
+            FROM character_cache
+            WHERE character_id = ?
+            """,
+            (character_id,),
+        ).fetchone()
+
+    return json.loads(row[0]) if row is not None else None
+
+
+def store_cached_character(character_id: int, details: dict) -> None:
+    """Persist normalized character details indefinitely."""
+    with sqlite3.connect(DB_PATH) as db:
+        db.execute(
+            """
+            INSERT INTO character_cache (character_id, details_json, cached_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(character_id) DO UPDATE SET
+                details_json = excluded.details_json,
+                cached_at = CURRENT_TIMESTAMP
+            """,
+            (character_id, json.dumps(details)),
+        )
+

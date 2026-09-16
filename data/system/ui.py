@@ -2,6 +2,7 @@
 
 import time
 import traceback
+from collections.abc import Awaitable, Callable
 
 import discord
 from discord import Interaction
@@ -18,7 +19,12 @@ from .metron_service import (
     schedule_issue_prefetch,
     schedule_series_prefetch,
 )
-from .settings import EMBED_COLOR, EMBED_DESCRIPTION_LIMIT, EMBED_FIELD_LIMIT
+from .settings import (
+    EMBED_COLOR,
+    EMBED_DESCRIPTION_LIMIT,
+    EMBED_FIELD_LIMIT,
+    ISSUE_SEARCH_FILTER_PAGE_SIZE,
+)
 from .utils import db_call, log_elapsed, truncate
 
 
@@ -165,12 +171,8 @@ class SeriesPageButton(
         *,
         disabled: bool = False,
     ):
-        if direction == "prev":
-            label = "Previous"
-            emoji = "◀️"
-        else:
-            label = "Next"
-            emoji = "▶️"
+        label = "Previous" if direction == "prev" else "Next"
+        emoji = "◀️" if direction == "prev" else "▶️"
 
         custom_id = f"carmine:series:{lookup_id}:{page}:{direction}:{user_id}"
         super().__init__(
@@ -436,12 +438,8 @@ class IssuePageButton(
         *,
         disabled: bool = False,
     ):
-        if direction == "prev":
-            label = "Previous"
-            emoji = "◀️"
-        else:
-            label = "Next"
-            emoji = "▶️"
+        label = "Previous" if direction == "prev" else "Next"
+        emoji = "◀️" if direction == "prev" else "▶️"
 
         custom_id = f"carmine:issue:{lookup_id}:{page}:{direction}:{user_id}"
 
@@ -599,7 +597,7 @@ class IssueListPageButton(
         r"(?P<direction>prev|next)"
     ),
 ):
-    """Persistent Previous/Next button for /issues result lists."""
+    """Persistent Previous/Next button for stored issue-list results."""
 
     def __init__(
         self,
@@ -609,12 +607,8 @@ class IssueListPageButton(
         *,
         disabled: bool = False,
     ):
-        if direction == "prev":
-            label = "Previous"
-            emoji = "◀️"
-        else:
-            label = "Next"
-            emoji = "▶️"
+        label = "Previous" if direction == "prev" else "Next"
+        emoji = "◀️" if direction == "prev" else "▶️"
 
         custom_id = f"carmine:issues:{search_id}:{page}:{direction}"
 
@@ -634,7 +628,7 @@ class IssueListPageButton(
 
     @classmethod
     async def from_custom_id(cls, interaction, item, match):
-        """Reconstruct a /issues button from the state in its custom ID."""
+        """Reconstruct an issue-list button from the state in its custom ID."""
         return cls(
             search_id=match["search_id"],
             page=int(match["page"]),
@@ -667,7 +661,14 @@ class IssueListPageButton(
                 )
                 return
 
-            date_label, pages = record
+            (
+                date_label,
+                query_text,
+                pages,
+                _page_entries,
+                _creator_ids,
+                _creator_names,
+            ) = record
 
             if not 0 <= self.page < len(pages):
                 await interaction.followup.send(
@@ -676,11 +677,12 @@ class IssueListPageButton(
                 )
                 return
 
-            embed = build_issue_list_embed(
+            embed = await build_issue_list_embed(
                 pages[self.page],
                 self.page,
                 len(pages),
                 date_label,
+                query_text,
             )
             view = build_issue_list_view(
                 self.search_id,
@@ -699,7 +701,7 @@ class IssueListPageButton(
         finally:
             log_elapsed(
                 "UI",
-                "/issues page change",
+                "issue list page change",
                 page_started,
                 context=page_context,
             )
@@ -710,7 +712,7 @@ def build_issue_list_view(
     current_page: int,
     total_pages: int,
 ) -> View:
-    """Build persistent Previous/Next controls for an /issues result list."""
+    """Build persistent Previous/Next controls for an /issue_search result list."""
     view = View(timeout=None)
 
     if total_pages <= 1:
@@ -739,15 +741,257 @@ def build_issue_list_view(
     return view
 
 
-def build_issue_list_embed(
+async def build_issue_list_embed(
     page_text: str,
     current_page: int,
     total_pages: int,
     date_label: str,
+    query_text: str = "",
 ) -> discord.Embed:
-    """Build one /issues result embed from a stored page string."""
+    """Build one stored issue-list result embed with its resolved search query."""
+    rendered_page = page_text.replace("**", "")
+    description = rendered_page
+    if query_text:
+        description = f"**Search Query**\n{query_text}\n\n{rendered_page}"
+
     return discord.Embed(
         title=f"Issues by {date_label} (Page {current_page + 1}/{total_pages})",
-        description=page_text,
+        description=description,
         color=EMBED_COLOR,
+    )
+
+
+class IssueSearchFilterSelect(discord.ui.Select):
+    """One temporary selector used to disambiguate an /issue_search filter."""
+
+    PAGE_SIZE = ISSUE_SEARCH_FILTER_PAGE_SIZE
+
+    def __init__(
+        self,
+        *,
+        filter_key: str,
+        filter_label: str,
+        query: str,
+        candidates: list[dict],
+        row: int,
+        page: int = 0,
+        selected_value: str | int = "all",
+    ) -> None:
+        self.filter_key = filter_key
+        self.page = page
+        self.candidates = candidates
+
+        page_count = max(1, (len(candidates) + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+        page = max(0, min(page, page_count - 1))
+        self.page = page
+        start = page * self.PAGE_SIZE
+        end = min(len(candidates), start + self.PAGE_SIZE)
+        page_candidates = candidates[start:end]
+
+        options = [
+            discord.SelectOption(
+                label="Show all matching results",
+                value="all",
+                description=f'Use every match for "{query}"'[:100],
+                default=(selected_value == "all"),
+            )
+        ]
+
+        for candidate in page_candidates:
+            candidate_value = str(candidate["id"])
+            options.append(
+                discord.SelectOption(
+                    label=str(candidate["label"])[:100],
+                    value=candidate_value,
+                    description=(candidate.get("description") or "")[:100] or None,
+                    default=(str(selected_value) == candidate_value),
+                )
+            )
+
+        if page > 0:
+            options.append(
+                discord.SelectOption(
+                    label="Previous matches",
+                    value="__previous_page__",
+                    description=f"Show match page {page} of {page_count}",
+                )
+            )
+        if page < page_count - 1:
+            options.append(
+                discord.SelectOption(
+                    label="Next matches",
+                    value="__next_page__",
+                    description=f"Show match page {page + 2} of {page_count}",
+                )
+            )
+
+        placeholder = f"{filter_label}: {query}"
+        if page_count > 1:
+            placeholder += f" (matches {page + 1}/{page_count})"
+
+        super().__init__(
+            placeholder=placeholder[:150],
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=row,
+        )
+
+    async def callback(self, interaction: Interaction) -> None:
+        """Remember a choice or move this dropdown to another match page."""
+        view = self.view
+        if not isinstance(view, IssueSearchFilterView):
+            await interaction.response.defer()
+            return
+
+        value = self.values[0]
+        if value == "__previous_page__":
+            await view.change_filter_page(interaction, self.filter_key, -1)
+            return
+        if value == "__next_page__":
+            await view.change_filter_page(interaction, self.filter_key, 1)
+            return
+
+        view.selections[self.filter_key] = (
+            "all" if value == "all" else int(value)
+        )
+        await interaction.response.defer()
+
+
+class IssueSearchFilterView(View):
+    """Temporary disambiguation controls shown before an /issue_search runs."""
+
+    def __init__(
+        self,
+        *,
+        user_id: int,
+        filters: list[dict],
+        on_submit: Callable[[Interaction, dict[str, str | int]], Awaitable[None]],
+        on_page_change: Callable[[str, int, int], Awaitable[None]] | None = None,
+    ) -> None:
+        super().__init__(timeout=900)
+        self.user_id = user_id
+        self.on_submit = on_submit
+        self.on_page_change = on_page_change
+        self.filters = filters
+        self.selections: dict[str, str | int] = {
+            item["key"]: "all" for item in filters
+        }
+        self.filter_pages: dict[str, int] = {
+            item["key"]: 0 for item in filters
+        }
+        self.message: discord.Message | None = None
+        self._rebuild_selects()
+
+    def _rebuild_selects(self) -> None:
+        """Rebuild dropdowns while preserving the Search Issues button."""
+        for child in list(self.children):
+            if isinstance(child, IssueSearchFilterSelect):
+                self.remove_item(child)
+
+        for row, item in enumerate(self.filters):
+            key = item["key"]
+            self.add_item(
+                IssueSearchFilterSelect(
+                    filter_key=key,
+                    filter_label=item["label"],
+                    query=item["query"],
+                    candidates=item["candidates"],
+                    row=row,
+                    page=self.filter_pages.get(key, 0),
+                    selected_value=self.selections.get(key, "all"),
+                )
+            )
+
+    async def change_filter_page(
+        self,
+        interaction: Interaction,
+        filter_key: str,
+        delta: int,
+    ) -> None:
+        """Move one dropdown between pages without losing other selections."""
+        spec = next((item for item in self.filters if item["key"] == filter_key), None)
+        if spec is None:
+            await interaction.response.defer()
+            return
+
+        page_count = max(
+            1,
+            (len(spec["candidates"]) + IssueSearchFilterSelect.PAGE_SIZE - 1)
+            // IssueSearchFilterSelect.PAGE_SIZE,
+        )
+        new_page = max(
+            0,
+            min(page_count - 1, self.filter_pages.get(filter_key, 0) + delta),
+        )
+
+        await interaction.response.defer()
+        if self.on_page_change is not None:
+            start = new_page * IssueSearchFilterSelect.PAGE_SIZE
+            end = min(
+                len(spec["candidates"]),
+                start + IssueSearchFilterSelect.PAGE_SIZE,
+            )
+            await self.on_page_change(filter_key, start, end)
+
+        self.filter_pages[filter_key] = new_page
+        self._rebuild_selects()
+        await interaction.edit_original_response(view=self)
+
+    async def interaction_check(self, interaction: Interaction) -> bool:
+        """Only the user who started the search may change its filters."""
+        if interaction.user.id == self.user_id:
+            return True
+
+        await interaction.response.send_message(
+            "Only the person who started this search can use these controls.",
+            ephemeral=True,
+        )
+        return False
+
+    @discord.ui.button(
+        label="Search Issues",
+        style=discord.ButtonStyle.primary,
+        row=4,
+    )
+    async def submit(
+        self,
+        interaction: Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        """Run the final issue query with the user's resolved filter choices."""
+        button.disabled = True
+        await interaction.response.edit_message(
+            content="**Searching comic issues...**",
+            embed=None,
+            view=None,
+        )
+        self.stop()
+        await self.on_submit(interaction, dict(self.selections))
+
+    async def on_timeout(self) -> None:
+        """Disable stale temporary filter controls after 15 minutes."""
+        for item in self.children:
+            item.disabled = True
+
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
+
+
+def build_issue_search_filter_view(
+    *,
+    user_id: int,
+    filters: list[dict],
+    on_submit: Callable[[Interaction, dict[str, str | int]], Awaitable[None]],
+    on_page_change: Callable[[str, int, int], Awaitable[None]] | None = None,
+) -> IssueSearchFilterView:
+    """Build the temporary disambiguation view for /issue_search."""
+    return IssueSearchFilterView(
+        user_id=user_id,
+        filters=filters,
+        on_submit=on_submit,
+        on_page_change=on_page_change,
     )

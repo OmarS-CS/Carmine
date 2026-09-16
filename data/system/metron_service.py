@@ -7,8 +7,10 @@ import traceback
 import mokkari
 
 from .database import (
+    load_cached_character,
     load_cached_issue,
     load_cached_series,
+    store_cached_character,
     store_cached_issue,
     store_cached_series,
 )
@@ -22,6 +24,7 @@ _metron_semaphore = asyncio.Semaphore(METRON_MAX_CONCURRENCY)
 _background_tasks: set[asyncio.Task] = set()
 _issue_fetch_tasks: dict[int, asyncio.Task] = {}
 _series_fetch_tasks: dict[int, asyncio.Task] = {}
+_character_fetch_tasks: dict[int, asyncio.Task] = {}
 
 
 async def metron_call(
@@ -62,7 +65,9 @@ def normalize_issue_details(issue) -> dict:
 
     normalized_credits = []
     for credit in credits:
-        creator = display_name(getattr(credit, "creator", None))
+        creator_obj = getattr(credit, "creator", None)
+        creator = display_name(creator_obj)
+        creator_id = getattr(creator_obj, "id", None)
         roles = getattr(credit, "role", None) or getattr(credit, "roles", None) or []
 
         if not isinstance(roles, (list, tuple, set)):
@@ -70,7 +75,13 @@ def normalize_issue_details(issue) -> dict:
 
         role_names = [display_name(role, "") for role in roles]
         role_names = [role for role in role_names if role]
-        normalized_credits.append({"creator": creator, "roles": role_names})
+        normalized_credits.append(
+            {
+                "creator_id": int(creator_id) if creator_id is not None else None,
+                "creator": creator,
+                "roles": role_names,
+            }
+        )
 
     resource_url = getattr(issue, "resource_url", None)
     image = getattr(issue, "image", None)
@@ -143,6 +154,60 @@ async def get_issue_details(issue_id: int) -> dict:
     finally:
         if _issue_fetch_tasks.get(issue_id) is task:
             del _issue_fetch_tasks[issue_id]
+
+
+def normalize_character_details(character) -> dict:
+    """Convert a Mokkari character-detail object into dropdown-friendly data."""
+    universes = getattr(character, "universes", None) or []
+    return {
+        "id": int(character.id),
+        "name": str(getattr(character, "name", None) or display_name(character)),
+        "universes": [display_name(universe) for universe in universes],
+    }
+
+
+async def get_character_details(character_id: int) -> dict:
+    """Return cached character details, fetching Metron only on a cache miss."""
+    cached = await db_call(
+        "character cache read",
+        load_cached_character,
+        character_id,
+        context={"character_id": character_id},
+    )
+    if cached is not None:
+        logger.info("[CACHE] character detail hit | character_id=%s", character_id)
+        return cached
+
+    logger.info("[CACHE] character detail miss | character_id=%s", character_id)
+
+    existing_task = _character_fetch_tasks.get(character_id)
+    if existing_task is not None:
+        return await existing_task
+
+    async def fetch_and_cache() -> dict:
+        character = await metron_call(
+            "character details",
+            metron.character,
+            character_id,
+            context={"character_id": character_id},
+        )
+        details = normalize_character_details(character)
+        await db_call(
+            "character cache write",
+            store_cached_character,
+            character_id,
+            details,
+            context={"character_id": character_id},
+        )
+        return details
+
+    task = asyncio.create_task(fetch_and_cache())
+    _character_fetch_tasks[character_id] = task
+    try:
+        return await task
+    finally:
+        if _character_fetch_tasks.get(character_id) is task:
+            del _character_fetch_tasks[character_id]
 
 
 def normalize_series_details(series) -> dict:
