@@ -5,11 +5,11 @@ Discord Bot to access and retrieve information from the Metron Comic Book Databa
 
 Requires Python 3.12
 
-You must create a 'config.py' file in the root directory of the project and add your Discord bot token, Metron username, and Metron password to it. The format should be as follows:
+You must create a 'config.env' file in the root directory of the project and add your Discord bot token, Metron username, and Metron password to it. The format should be as follows:
 ```
-token = 'tokenHere'
-username = 'usernameHere'
-password = 'passwordHere'
+DISCORD_TOKEN=your_discord_bot_token_here
+METRON_USERNAME=your_metron_username_here
+METRON_PASSWORD=your_metron_password_here
 ```
 
 ### Windows First-time Setup
